@@ -93,7 +93,7 @@ export class CurateService {
     } else
       result = await new Promise((resolve, reject) => {
         const worker = new Worker(new URL('./worker.mjs', import.meta.url), {
-          workerData: { path: this.repo.databasePath, stacks, candidate: this.candidateEnabled, rankConnection: this.refinement?.connection,
+          workerData: { path: this.repo.databasePath, postgres: this.repo.postgres, stacks, candidate: this.candidateEnabled, rankConnection: this.refinement?.connection,
             embeddings: embeddingPolicy },
           // Server/test-runner flags (including --input-type) need not be valid worker flags.
           execArgv: [],

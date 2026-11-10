@@ -1,6 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
-
-import { preparePrivateDatabasePath, restrictPrivateDatabaseModes } from '../privateDatabase.mjs';
+import { openDatabase } from '../database/open.mjs';
 
 const DEFAULT_FRAME_DB_PATH = './data/frame.db';
 
@@ -14,15 +12,13 @@ const DEFAULT_FRAME_DB_PATH = './data/frame.db';
 export function createVoiceMetrics({
   dbPath = process.env.FRAME_DB_PATH || DEFAULT_FRAME_DB_PATH,
   logger = console,
+  postgres,
 } = {}) {
   let db;
 
   try {
-    preparePrivateDatabasePath(dbPath, logger);
-    db = new DatabaseSync(dbPath);
-    db.exec('PRAGMA journal_mode = WAL');
-    restrictPrivateDatabaseModes(dbPath, logger);
-    migrateLegacyTable(db);
+    db = openDatabase(dbPath, postgres, { logger });
+    if (!postgres) migrateLegacyTable(db);
     db.exec(`
       CREATE TABLE IF NOT EXISTS voice_command_stats (
         device_id    TEXT NOT NULL DEFAULT '',
@@ -47,6 +43,7 @@ export function createVoiceMetrics({
     } catch {
       // already closed or never opened
     }
+    if (postgres) throw error;
     return createNoopVoiceMetrics();
   }
 
@@ -54,7 +51,7 @@ export function createVoiceMetrics({
     INSERT INTO voice_command_stats (device_id, label, uses, last_used_at)
     VALUES (?, ?, 1, ?)
     ON CONFLICT(device_id, label) DO UPDATE SET
-      uses = uses + 1,
+      uses = voice_command_stats.uses + 1,
       last_used_at = excluded.last_used_at
   `);
 

@@ -16,6 +16,7 @@ services:
       # Strongly recommended: protects the API and web UI on your network.
       # Blank or missing refuses to start unless the separate dangerous
       # open-mode switch is explicitly true.
+      PICTARIA_DATABASE_URL: ${PICTARIA_DATABASE_URL:-}
       APP_PASSWORD: ${APP_PASSWORD:-}
       ALLOW_INSECURE_OPEN: ${ALLOW_INSECURE_OPEN:-false}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}

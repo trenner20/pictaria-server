@@ -131,14 +131,14 @@ export function installCurateTriggers(db) {
         table === 'review_list' ? '1' : `EXISTS(SELECT 1 FROM review_list WHERE asset_id=${ref}.asset_id)`;
       const changed =
         table === 'assets' && event === 'UPDATE'
-          ? ` AND (${projectionColumns.map((column) => `NEW.${column} IS NOT OLD.${column}`).join(' OR ') || '0'})`
+          ? ` AND (${projectionColumns.map((column) => `NEW.${column} IS NOT OLD.${column}`).join(' OR ') || 'FALSE'})`
           : '';
       // Replace the definition on boot, including existing development databases.
       db.exec(`DROP TRIGGER IF EXISTS curate_${table}_${event.toLowerCase()};
         CREATE TRIGGER curate_${table}_${event.toLowerCase()}
         AFTER ${event} ON ${table} WHEN ${relevant}${changed} BEGIN
         INSERT INTO curate_dirty(asset_id,version) VALUES(${ref}.asset_id,1)
-          ON CONFLICT(asset_id) DO UPDATE SET version=version+1;
+          ON CONFLICT(asset_id) DO UPDATE SET version=curate_dirty.version+1;
         END;`);
     }
   }

@@ -130,7 +130,7 @@ export class EnrichTimingStore {
     return this.atomic(() => {
       this.#interruptPhotos(id);
       this.db.prepare(`UPDATE enrich_timing_runs SET outcome = 'interrupted'
-        WHERE outcome = 'running' AND (? IS NULL OR id = ?)`).run(id, id);
+        WHERE outcome = 'running' AND (CAST(? AS BIGINT) IS NULL OR id = ?)`).run(id, id);
     });
   }
 
@@ -139,9 +139,9 @@ export class EnrichTimingStore {
     // requests (including response_received) and never fabricate an end time.
     this.db.prepare(`UPDATE enrich_provider_attempts SET outcome = 'interrupted'
       WHERE outcome = 'running' AND photo_execution_id IN
-      (SELECT id FROM enrich_photo_executions WHERE (? IS NULL OR timing_run_id = ?))`).run(id, id);
+      (SELECT id FROM enrich_photo_executions WHERE (CAST(? AS BIGINT) IS NULL OR timing_run_id = ?))`).run(id, id);
     this.db.prepare(`UPDATE enrich_photo_executions SET outcome = 'interrupted'
-      WHERE outcome = 'running' AND (? IS NULL OR timing_run_id = ?)`).run(id, id);
+      WHERE outcome = 'running' AND (CAST(? AS BIGINT) IS NULL OR timing_run_id = ?)`).run(id, id);
   }
 
   skip(runId, reason) {

@@ -1700,6 +1700,7 @@
       }
       el('backupStatusLine').textContent = [
         `Destination: ${status.dir}`,
+        status.postgresBackupRequired ? 'Local files only. Back up PostgreSQL separately.' : null,
         `${status.count} snapshot${status.count === 1 ? '' : 's'} kept`,
         status.lastAt ? `newest ${new Date(status.lastAt).toLocaleString()}` : 'none yet',
         status.lastResult?.complete === false
@@ -1721,7 +1722,9 @@
         if (!response.ok) throw new Error(body?.error?.message ?? 'Backup failed');
         el('note-backup').textContent = body.complete === false
           ? `Backup incomplete — missing ${(body.missing ?? []).map((entry) => entry.name).join(', ')}. Older complete snapshots were preserved.`
-          : `Backed up ${(body.bytes / 1024 / 1024).toFixed(1)} MB (${body.files.length} files).`;
+          : body.postgresBackupRequired
+            ? 'Local files backed up. Back up PostgreSQL separately.'
+            : `Backed up ${(body.bytes / 1024 / 1024).toFixed(1)} MB (${body.files.length} files).`;
         void loadBackupStatus();
       } catch (error) {
         el('note-backup').textContent = error.message;

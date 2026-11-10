@@ -23,7 +23,7 @@ export class StackingLab {
       if (this.closed) throw Error('The stacking lab is stopping.');
       const result = await new Promise((resolve, reject) => {
         const worker = new Worker(new URL('./lab-worker.mjs', import.meta.url), {
-          workerData: { path: this.curate.repo.databasePath, gapMs: gapSeconds * 1000, sort }, execArgv: [],
+          workerData: { path: this.curate.repo.databasePath, postgres: this.curate.repo.postgres, gapMs: gapSeconds * 1000, sort }, execArgv: [],
         });
         this.worker = worker;
         let message;

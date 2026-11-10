@@ -80,10 +80,10 @@ export class CurateMetadataStore {
     this.prepare(
       `INSERT INTO curate_metadata(asset_id,source_key,priority) VALUES(?,?,?)
       ON CONFLICT(asset_id) DO UPDATE SET
-      priority=CASE WHEN excluded.priority=1 THEN 1 WHEN context_until>? AND (next_at<=? OR source_key IS NOT excluded.source_key) THEN 2 ELSE 0 END,
-      next_at=CASE WHEN source_key IS NOT excluded.source_key
-        THEN MIN(next_at,MAX(?,COALESCE(last_attempt_at,0)+?)) ELSE next_at END,
-      outcome=CASE WHEN source_key IS NOT excluded.source_key THEN 'pending' ELSE outcome END,
+      priority=CASE WHEN excluded.priority=1 THEN 1 WHEN curate_metadata.context_until>? AND (curate_metadata.next_at<=? OR curate_metadata.source_key IS NOT excluded.source_key) THEN 2 ELSE 0 END,
+      next_at=CASE WHEN curate_metadata.source_key IS NOT excluded.source_key
+        THEN MIN(curate_metadata.next_at,MAX(?,COALESCE(curate_metadata.last_attempt_at,0)+?)) ELSE curate_metadata.next_at END,
+      outcome=CASE WHEN curate_metadata.source_key IS NOT excluded.source_key THEN 'pending' ELSE curate_metadata.outcome END,
       source_key=excluded.source_key`,
     ).run(id, key, state === 'undecided' ? 1 : 0, now, now, now, METADATA_LIMITS.minIntervalMs);
   }

@@ -5,6 +5,30 @@ decisions, the AI tags and captions from enrichment runs, your album rules,
 location groups, and settings. Your **photos are not part of this** — they
 live in Immich and are covered by whatever backs Immich up.
 
+## PostgreSQL backups
+
+When `PICTARIA_DATABASE_URL` is set, Pictaria's backup UI and CLI snapshot only
+local data files. Use your database provider's backups or schedule `pg_dump`
+separately for the dedicated Pictaria database. Keep the database backup and
+the matching local snapshot together. Before a backend switch or upgrade,
+stop Pictaria while taking both so they describe the same installation state.
+
+For example, using PostgreSQL client tools that support your server version:
+
+```sh
+pg_dump --host=db.example --username=pictaria --format=custom --file=pictaria.dump pictaria
+```
+
+Restore with Pictaria stopped. Restore the local snapshot and the dump into an
+empty dedicated PostgreSQL database, then start with the restored database
+URL and local data directory.
+
+```sh
+pg_restore --host=db.example --username=pictaria --dbname=pictaria --no-owner --exit-on-error --single-transaction pictaria.dump
+```
+
+The file list and SQLite snapshot procedure below apply to SQLite mode.
+
 ## What to back up
 
 | File | Contents | Replaceable? |

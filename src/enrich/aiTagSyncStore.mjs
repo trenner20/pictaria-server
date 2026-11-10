@@ -30,7 +30,7 @@ export class AiTagSyncStore {
   }
 
   next(limit = 10) {
-    return this.db.prepare(`SELECT asset_id AS assetId,generation,attempts FROM ai_tag_sync
+    return this.db.prepare(`SELECT asset_id AS "assetId",generation,attempts FROM ai_tag_sync
       WHERE status='pending' ORDER BY updated_at,asset_id LIMIT ?`).all(Math.max(1, Math.min(10, limit)));
   }
 

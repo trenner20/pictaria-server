@@ -5,6 +5,13 @@ All notable changes to Pictaria Server are documented here. This project follows
 
 ## Unreleased
 
+### Storage
+
+- Add optional PostgreSQL storage for Enrich, Curate, Insights, Frame and
+  voice metrics. SQLite remains the default. An offline import carries
+  existing SQLite records into a dedicated PostgreSQL database. See
+  [Running with PostgreSQL](docs/RUNNING.md#running-with-postgresql).
+
 ### Runtime and security
 
 - Move the container to Node 24.22.1 LTS, pinned to the official multi-platform

@@ -7,6 +7,20 @@ import { DEFAULT_EMBEDDING_MODEL, normalizeEmbeddingModel, validEmbeddingModel }
 
 const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
+function postgresUrl(env) {
+  const url = env.PICTARIA_DATABASE_URL?.trim();
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    if (['postgres:', 'postgresql:'].includes(parsed.protocol) && parsed.hostname && parsed.pathname.length > 1) {
+      return url;
+    }
+  } catch {
+    // Never print the connection string, which can contain credentials.
+  }
+  throw new Error('PICTARIA_DATABASE_URL must be a PostgreSQL URL with a host and database name.');
+}
+
 export function loadConfig(env = process.env) {
   const settingsPath = resolvePath(env.SETTINGS_PATH, join(ROOT_DIR, 'data', 'settings.json'));
   const persistentStateInventoryPath = join(dirname(settingsPath), 'persistent-state.json');
@@ -36,6 +50,7 @@ export function loadConfig(env = process.env) {
     immichPublicUrl: normalizeBaseUrl(env.IMMICH_PUBLIC_URL || env.IMMICH_BASE_URL || ''),
     immichApiKey: env.IMMICH_API_KEY || '',
     requestTimeoutMs: parseInteger(env.REQUEST_TIMEOUT_MS, 60000),
+    postgresUrl: postgresUrl(env),
     databasePath: resolvePath(env.DATABASE_PATH, join(ROOT_DIR, 'data', 'enrichment.sqlite')),
     settingsPath,
     persistentState: {

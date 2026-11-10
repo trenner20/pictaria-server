@@ -61,7 +61,7 @@ import { writePrivateFileAtomicSync } from './atomicFile.mjs';
 // one with the other while reporting both as backed up. Roles match the
 // default basenames so existing snapshots stay recognizable and restorable.
 export function backupTargets(config) {
-  return [
+  const sqliteTargets = [
     {
       role: 'enrichment.sqlite',
       path: config.databasePath,
@@ -80,6 +80,9 @@ export function backupTargets(config) {
       kind: 'sqlite',
       validate: validateSqlitePersistentState,
     },
+  ];
+  return [
+    ...(config.postgresUrl ? [] : sqliteTargets),
     {
       role: 'settings.json',
       path: config.settingsPath,

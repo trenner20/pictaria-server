@@ -128,7 +128,7 @@ export class EmbeddingStore {
   // rests on the recorded checksum/thumbhash described above.
   isCurrent(assetId, spaceId, { imageSha256 = null } = {}) {
     return this.db.prepare(`SELECT 1 FROM asset_embeddings e JOIN assets a ON a.asset_id=e.asset_id
-      WHERE e.asset_id=? AND e.space_id=? AND ${CURRENT} AND (? IS NULL OR e.image_sha256=?)`)
+      WHERE e.asset_id=? AND e.space_id=? AND ${CURRENT} AND (CAST(? AS TEXT) IS NULL OR e.image_sha256=?)`)
       .get(assetId, spaceId, imageSha256, imageSha256) !== undefined;
   }
 
@@ -207,7 +207,7 @@ export class EmbeddingStore {
     const counts = space ? this.db.prepare(`SELECT COUNT(*) AS vectors,
         COALESCE(SUM(CASE WHEN a.asset_id IS NOT NULL AND ${CURRENT} THEN 1 ELSE 0 END), 0) AS current
       FROM asset_embeddings e LEFT JOIN assets a ON a.asset_id=e.asset_id WHERE e.space_id=?`).get(space.id) : null;
-    const other = this.db.prepare('SELECT COUNT(*) AS n FROM asset_embeddings WHERE space_id IS NOT ?').get(space?.id ?? null).n;
+    const other = this.db.prepare('SELECT COUNT(*) AS n FROM asset_embeddings WHERE space_id IS DISTINCT FROM ?').get(space?.id ?? null).n;
     const value = {
       space: space ? { dims: space.dims, createdAt: space.createdAt, verifiedAt: space.verifiedAt } : null,
       vectors: counts?.vectors ?? 0,
@@ -239,10 +239,10 @@ export class EmbeddingStore {
   // photo walks again from the top (EmbeddingBackfill does).
   missingEnriched(spaceId, { after = null, limit = 200 } = {}) {
     const rows = after
-      ? this.db.prepare(`SELECT a.asset_id AS assetId, ${CAPTURE_ORDER} AS capturedAt ${ENRICHED} AND NOT ${HAS_CURRENT}
+      ? this.db.prepare(`SELECT a.asset_id AS "assetId", ${CAPTURE_ORDER} AS "capturedAt" ${ENRICHED} AND NOT ${HAS_CURRENT}
           AND (${CAPTURE_ORDER}, a.asset_id) < (?, ?) ORDER BY ${CAPTURE_ORDER} DESC, a.asset_id DESC LIMIT ?`)
         .all(spaceId, after.capturedAt, after.assetId, limit)
-      : this.db.prepare(`SELECT a.asset_id AS assetId, ${CAPTURE_ORDER} AS capturedAt ${ENRICHED} AND NOT ${HAS_CURRENT}
+      : this.db.prepare(`SELECT a.asset_id AS "assetId", ${CAPTURE_ORDER} AS "capturedAt" ${ENRICHED} AND NOT ${HAS_CURRENT}
           ORDER BY ${CAPTURE_ORDER} DESC, a.asset_id DESC LIMIT ?`).all(spaceId, limit);
     return rows.map((row) => ({ assetId: row.assetId, capturedAt: row.capturedAt }));
   }
@@ -259,7 +259,7 @@ export class EmbeddingStore {
       return cached.value;
     }
     const inUse = this.latestSpace({ backend, model })?.id ?? null;
-    const value = this.db.prepare(`SELECT s.id, s.model, s.dims, s.created_at AS createdAt, s.verified_at AS verifiedAt,
+    const value = this.db.prepare(`SELECT s.id, s.model, s.dims, s.created_at AS "createdAt", s.verified_at AS "verifiedAt",
         COUNT(e.asset_id) AS vectors,
         COALESCE(SUM(CASE WHEN a.asset_id IS NOT NULL AND ${CURRENT} THEN 1 ELSE 0 END), 0) AS current
       FROM embedding_spaces s LEFT JOIN asset_embeddings e ON e.space_id=s.id LEFT JOIN assets a ON a.asset_id=e.asset_id
