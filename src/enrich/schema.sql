@@ -1,3 +1,23 @@
+CREATE TABLE IF NOT EXISTS enrich_profiles (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  current_revision_id TEXT NOT NULL,
+  archived INTEGER NOT NULL DEFAULT 0,
+  is_default INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_enrich_profile_default ON enrich_profiles(is_default) WHERE is_default = 1;
+CREATE TABLE IF NOT EXISTS enrich_profile_revisions (
+  id TEXT PRIMARY KEY,
+  profile_id TEXT NOT NULL REFERENCES enrich_profiles(id),
+  revision INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  system_prompt TEXT NOT NULL,
+  user_template TEXT NOT NULL,
+  taxonomy_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(profile_id, revision)
+);
+
 CREATE TABLE IF NOT EXISTS assets (
   asset_id TEXT PRIMARY KEY,
   original_path TEXT,
@@ -244,23 +264,3 @@ CREATE INDEX IF NOT EXISTS idx_activity_log_at ON activity_log(at DESC, id DESC)
 CREATE INDEX IF NOT EXISTS idx_activity_log_category_at ON activity_log(category, at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_log_type_at ON activity_log(type, at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_log_provider_at ON activity_log(provider, at DESC, id DESC);
-
-CREATE TABLE IF NOT EXISTS enrich_profiles (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  current_revision_id TEXT NOT NULL,
-  archived INTEGER NOT NULL DEFAULT 0,
-  is_default INTEGER NOT NULL DEFAULT 0
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_enrich_profile_default ON enrich_profiles(is_default) WHERE is_default = 1;
-CREATE TABLE IF NOT EXISTS enrich_profile_revisions (
-  id TEXT PRIMARY KEY,
-  profile_id TEXT NOT NULL REFERENCES enrich_profiles(id),
-  revision INTEGER NOT NULL,
-  name TEXT NOT NULL,
-  system_prompt TEXT NOT NULL,
-  user_template TEXT NOT NULL,
-  taxonomy_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE(profile_id, revision)
-);

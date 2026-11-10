@@ -12,8 +12,8 @@ export const LEASE_MS = 30 * 60_000;
 export const MAX_LEASES = 200;
 export const MAX_VIEW_LEASES = 200;
 export const MAX_LEASE_BYTES = 5 * 1024 * 1024;
-const HOT = `asset_id id,captured_ms time,checksum,duplicate_id duplicateId,rendition_key renditionKey,
- input_key inputKey,material_key materialKey,people_count peopleCount,recognized_count recognizedCount,availability`;
+const HOT = `asset_id id,captured_ms time,checksum,duplicate_id AS "duplicateId",rendition_key AS "renditionKey",
+ input_key AS "inputKey",material_key AS "materialKey",people_count AS "peopleCount",recognized_count AS "recognizedCount",availability`;
 
 export class CurateRepository {
   constructor(repo) {
@@ -206,12 +206,12 @@ export class CurateRepository {
   }
   pending() {
     return this.prepare(
-      `SELECT asset_id id,captured_ms time,checksum,duplicate_id duplicateId,rendition_key renditionKey,people_count peopleCount,recognized_count recognizedCount,availability FROM curate_photos WHERE state='undecided' ORDER BY captured_ms,asset_id`,
+      `SELECT asset_id id,captured_ms time,checksum,duplicate_id AS "duplicateId",rendition_key AS "renditionKey",people_count AS "peopleCount",recognized_count AS "recognizedCount",availability FROM curate_photos WHERE state='undecided' ORDER BY captured_ms,asset_id`,
     ).all();
   }
   candidateRows() {
     return this.prepare(`SELECT ${HOT},
-      json_extract(evidence_json,'$.category.peopleCategory') peopleCategory,
+      json_extract(evidence_json,'$.category.peopleCategory') AS "peopleCategory",
       json_extract(evidence_json,'$.recognition') recognition,
       json_extract(evidence_json,'$.image.thumbhash') thumbhash
       FROM curate_photos WHERE state='undecided' ORDER BY captured_ms,asset_id`).all();
@@ -237,7 +237,7 @@ export class CurateRepository {
       WHERE m.asset_id=? ORDER BY m.separation_id`).all(id));
   }
   photo(id) {
-    return this.prepare(`SELECT ${HOT},state,human_key humanKey FROM curate_photos WHERE asset_id=?`).get(id);
+    return this.prepare(`SELECT ${HOT},state,human_key AS "humanKey" FROM curate_photos WHERE asset_id=?`).get(id);
   }
   details(ids) {
     return ids.map((id) => {
@@ -273,7 +273,7 @@ export class CurateRepository {
   corrections(offset = 0, limit = 50) {
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 50)
       throw new CurateError('Invalid corrections page.', 'invalid_curate_query', 400);
-    const rows = this.prepare(`SELECT id,revision,created_at createdAt FROM curate_separations
+    const rows = this.prepare(`SELECT id,revision,created_at AS "createdAt" FROM curate_separations
       WHERE active=1 ORDER BY created_at DESC,id LIMIT ? OFFSET ?`).all(limit + 1, offset);
     return {
       corrections: rows.slice(0, limit).map(row => ({ ...row, active: true,

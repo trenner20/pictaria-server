@@ -36,7 +36,9 @@ export class EnrichmentProfiles {
       // and an existing "My profile" are left alone.
       const starter = this.db.prepare(`SELECT p.id FROM enrich_profiles p
         JOIN enrich_profile_revisions r ON r.id = p.current_revision_id
-        WHERE p.rowid = (SELECT MIN(rowid) FROM enrich_profiles)
+        WHERE ${this.db.dialect === 'postgres'
+          ? 'p.id = (SELECT profile_id FROM enrich_profile_revisions ORDER BY created_at, id LIMIT 1)'
+          : 'p.rowid = (SELECT MIN(rowid) FROM enrich_profiles)'}
           AND p.name = 'Default' AND r.name = 'Default' AND r.revision = 1
           AND p.archived = 0
           AND NOT EXISTS (SELECT 1 FROM enrich_profiles WHERE name = 'My profile')`).get();

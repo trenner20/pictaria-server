@@ -18,6 +18,7 @@ export function createBackupRoutes({ config, backupState }) {
       sendJson(response, 200, {
         dir: config.backup.dir,
         enabled: config.backup.enabled,
+        postgresBackupRequired: Boolean(config.postgresUrl),
         intervalHours: config.backup.intervalHours,
         keep: config.backup.keep,
         running: backupState.running,
@@ -43,7 +44,7 @@ export function createBackupRoutes({ config, backupState }) {
         const result = await runBackup(config);
         backupState.lastResult = result;
         backupState.lastError = null;
-        sendJson(response, 200, result);
+        sendJson(response, 200, { ...result, postgresBackupRequired: Boolean(config.postgresUrl) });
       } catch (error) {
         backupState.lastError = error instanceof Error ? error.message : String(error);
         const coordinated = error?.code === 'backup_running';

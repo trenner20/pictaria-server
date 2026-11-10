@@ -1,7 +1,6 @@
-import { DatabaseSync } from 'node:sqlite';
+import { openDatabase } from '../database/open.mjs';
 
 import { addColumnIfMissing, migrateDatabase } from '../migrations.mjs';
-import { preparePrivateDatabasePath, restrictPrivateDatabaseModes } from '../privateDatabase.mjs';
 import { isValidCalendarDay } from './dates.mjs';
 
 export const MAX_INSIGHTS_TAG_ID_LENGTH = 128;
@@ -82,16 +81,9 @@ const INSIGHTS_MIGRATIONS = [
 ];
 
 export class InsightsRepository {
-  constructor(dbPath) {
+  constructor(dbPath, postgres) {
     this.dbPath = String(dbPath);
-    preparePrivateDatabasePath(this.dbPath);
-    this.db = new DatabaseSync(this.dbPath);
-    // The sweep cache mirrors private library metadata (people, places,
-    // dates) — keep it readable by the server user only, even on a bind
-    // mount with a permissive umask. Tolerate failure (exotic filesystems);
-    // the warning is enough.
-    this.db.exec('PRAGMA journal_mode = WAL');
-    restrictPrivateDatabaseModes(this.dbPath);
+    this.db = openDatabase(this.dbPath, postgres);
     migrateDatabase(this.db, { schema: SCHEMA, migrations: INSIGHTS_MIGRATIONS });
     this.locationGroups = [];
     this.groupsByName = new Map();
@@ -141,7 +133,9 @@ export class InsightsRepository {
     this.db.exec(`
       DROP TABLE IF EXISTS swept_assets_staging;
       DROP TABLE IF EXISTS asset_people_staging;
-      CREATE TABLE swept_assets_staging AS SELECT * FROM swept_assets WHERE 0;
+      ${this.db.dialect === 'postgres'
+        ? 'CREATE TABLE swept_assets_staging (LIKE swept_assets INCLUDING ALL)'
+        : 'CREATE TABLE swept_assets_staging AS SELECT * FROM swept_assets WHERE 0'};
       CREATE TABLE asset_people_staging AS SELECT * FROM asset_people WHERE 0;
     `);
   }
@@ -150,9 +144,10 @@ export class InsightsRepository {
     this.transaction(() => {
       this.db.exec('DELETE FROM swept_assets');
       this.db.exec('DELETE FROM asset_people');
-      // OR REPLACE / OR IGNORE: the staging tables carry no constraints, so
-      // an asset repeated across sweep pages collapses here.
-      this.db.exec('INSERT OR REPLACE INTO swept_assets SELECT * FROM swept_assets_staging');
+      // SQLite staging has no constraints and deduplicates here. PostgreSQL
+      // staging upserts on the asset primary key as pages arrive.
+      const insert = this.db.dialect === 'postgres' ? 'INSERT' : 'INSERT OR REPLACE';
+      this.db.exec(`${insert} INTO swept_assets SELECT * FROM swept_assets_staging`);
       this.db.exec('INSERT OR IGNORE INTO asset_people SELECT * FROM asset_people_staging');
     });
     this.abortSweepStaging();
@@ -413,7 +408,7 @@ export class InsightsRepository {
   topCameras(limit = 10) {
     return this.db
       .prepare(`
-        SELECT make, model, TRIM(COALESCE(make, '') || ' ' || COALESCE(model, '')) AS name, COUNT(*) AS count
+        SELECT MIN(make) AS make, MIN(model) AS model, TRIM(COALESCE(make, '') || ' ' || COALESCE(model, '')) AS name, COUNT(*) AS count
         FROM swept_assets
         WHERE COALESCE(model, '') != ''
         GROUP BY name ORDER BY count DESC LIMIT ?
@@ -499,7 +494,7 @@ export class InsightsRepository {
         JOIN asset_people b ON b.asset_id = a.asset_id AND b.person_id > a.person_id
         JOIN people_stats pa ON pa.id = a.person_id
         JOIN people_stats pb ON pb.id = b.person_id
-        GROUP BY a.person_id, b.person_id
+        GROUP BY a.person_id, b.person_id, pa.name, pb.name
         ORDER BY count DESC
         LIMIT ?
       `)
@@ -617,7 +612,7 @@ export class InsightsRepository {
         JOIN asset_people b ON b.asset_id = a.asset_id AND b.person_id != a.person_id
         JOIN people_stats ps ON ps.id = b.person_id
         WHERE a.person_id = ?
-        GROUP BY b.person_id ORDER BY count DESC, ps.name LIMIT ?
+        GROUP BY b.person_id, ps.name ORDER BY count DESC, ps.name LIMIT ?
       `)
       .all(personId, connectionLimit)
       .map((row) => ({ id: row.id, name: row.name, count: Number(row.count) }));
@@ -730,7 +725,7 @@ export class InsightsRepository {
     const cells = this.db
       .prepare(`
         SELECT day, alat, alon FROM (
-          SELECT day, ROUND(lat, 1) AS rlat, ROUND(lon, 1) AS rlon,
+          SELECT day, ROUND(CAST(lat AS NUMERIC), 1) AS rlat, ROUND(CAST(lon AS NUMERIC), 1) AS rlon,
                  AVG(lat) AS alat, AVG(lon) AS alon,
                  ROW_NUMBER() OVER (PARTITION BY day ORDER BY COUNT(*) DESC) AS rn
           FROM swept_assets

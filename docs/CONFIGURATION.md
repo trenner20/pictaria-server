@@ -122,6 +122,7 @@ review**; their rules, albums, and manual **Run** action remain available.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
+| `PICTARIA_DATABASE_URL` | Empty (SQLite) | Set a PostgreSQL connection URL to use PostgreSQL for all three database stores. See [Running with PostgreSQL](RUNNING.md#running-with-postgresql). |
 | `DATABASE_PATH` | `data/enrichment.sqlite` | Enrichment results and review decisions — the record of truth for curation. |
 | `ALBUMS_DATA_FILE` | `data/smart-albums.json` | Smart-album job definitions and run state. |
 | `FRAME_DB_PATH` | `data/frame.db` | Frame display ledger (five years of recent display history, with generous per-frame and installation-wide row/byte ceilings) and voice command usage counters — both power the Frame Metrics page (`/metrics.html`). |

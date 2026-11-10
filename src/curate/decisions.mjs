@@ -66,7 +66,7 @@ export class DecisionRepository {
     });
   }
   pendingFor(assetId) {
-    return this.db.prepare(`SELECT * FROM decision_intents WHERE asset_id=? AND synced_revision IS NOT revision ORDER BY tag`).all(assetId);
+    return this.db.prepare(`SELECT * FROM decision_intents WHERE asset_id=? AND synced_revision IS DISTINCT FROM revision ORDER BY tag`).all(assetId);
   }
   acknowledge(rows) {
     this.repo.transaction(() => {
@@ -271,7 +271,7 @@ export class DecisionRepository {
         WHERE settled_at IS NULL AND id>? ORDER BY id LIMIT 100`).all(this.pruneCursor);
       for (const {id} of candidates) {
         this.db.prepare(`UPDATE decision_operations SET settled_at=? WHERE id=? AND NOT EXISTS (
-          SELECT 1 FROM decision_operation_members m, json_each(m.scope_json) t
+          SELECT 1 FROM decision_operation_members m CROSS JOIN json_each(m.scope_json) t
           JOIN decision_intents i ON i.asset_id=m.asset_id AND i.tag=t.value
           WHERE m.operation_id=? AND i.revision=? AND i.synced_revision IS NOT i.revision
         ) AND NOT EXISTS(SELECT 1 FROM decision_sync_links WHERE operation_id=?)`).run(now,id,id,id,id);

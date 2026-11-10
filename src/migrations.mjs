@@ -36,6 +36,10 @@ export function migrateDatabase(db, { schema, migrations = [], prepare = () => (
     previous = migration.version;
   }
 
+  if (db.dialect === 'postgres') {
+    db.request('functions');
+    db.exec('CREATE TABLE IF NOT EXISTS pictaria_schema_version (id BIGINT PRIMARY KEY CHECK (id = 1), version BIGINT NOT NULL)');
+  }
   const fresh = db
     .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table'")
     .get().n === 0;
@@ -43,9 +47,14 @@ export function migrateDatabase(db, { schema, migrations = [], prepare = () => (
   const from = getUserVersion(db);
 
   if (fresh) {
-    db.exec(schema);
-    if (latest > 0) {
-      setUserVersion(db, latest);
+    if (db.dialect === 'postgres') db.exec('BEGIN');
+    try {
+      db.exec(schema);
+      if (latest > 0) setUserVersion(db, latest);
+      if (db.dialect === 'postgres') db.exec('COMMIT');
+    } catch (error) {
+      if (db.dialect === 'postgres') db.exec('ROLLBACK');
+      throw error;
     }
     return { fresh: true, from, applied: [] };
   }
@@ -72,10 +81,15 @@ export function migrateDatabase(db, { schema, migrations = [], prepare = () => (
 }
 
 export function getUserVersion(db) {
+  if (db.dialect === 'postgres') return db.prepare('SELECT version FROM pictaria_schema_version WHERE id = 1').get()?.version ?? 0;
   return Number(db.prepare('PRAGMA user_version').get().user_version);
 }
 
 function setUserVersion(db, version) {
+  if (db.dialect === 'postgres') {
+    db.prepare('INSERT INTO pictaria_schema_version VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET version = excluded.version').run(version);
+    return;
+  }
   db.exec(`PRAGMA user_version = ${Number(version)}`);
 }
 

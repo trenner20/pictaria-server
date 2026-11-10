@@ -254,6 +254,7 @@ export class PersistentStateGuard {
 }
 
 export function inspectPersistentTarget(target) {
+  if (target.inspect) return target.inspect();
   if (!pathEntryExists(target.path)) {
     return { valid: false, reason: TARGET_MISSING_REASON };
   }

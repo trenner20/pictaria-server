@@ -14,8 +14,8 @@
 import { loadConfig } from '../src/config.mjs';
 import { adoptBackupDestination, runBackup } from '../src/backup.mjs';
 
-const config = loadConfig();
 try {
+  const config = loadConfig();
   // --adopt: the one-time explicit trust step for a custom BACKUP_DIR —
   // run it while the real destination is mounted; the first snapshot
   // follows immediately.
@@ -23,6 +23,7 @@ try {
     console.log(`Adopted backup destination: ${adoptBackupDestination(config)}`);
   }
   const result = await runBackup(config);
+  if (config.postgresUrl) console.log('Local files only. Back up PostgreSQL separately.');
   const mb = (result.bytes / 1024 / 1024).toFixed(1);
   console.log(`Backup written: ${result.dir}`);
   for (const file of result.files) {

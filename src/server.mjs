@@ -67,13 +67,18 @@ import { createClientAddressResolver } from './trustedProxy.mjs';
 import { createActivityLog } from './activity/log.mjs';
 import { createActivityHistory } from './activity/history.mjs';
 import { createActivityRoutes } from './routes/activity.mjs';
+import { PostgresDatabase } from './database/postgres.mjs';
+import { POSTGRES_OWNER_LOCK, postgresOptions, postgresPersistentTargets } from './database/postgres-layout.mjs';
 import { createBrowserAuthorityPolicy } from './browserAuthority.mjs';
 import { UpstreamPaginationError } from './pagination.mjs';
 
 // Captured once, before startup checks and migrations, so health reports the
 // age of this server process rather than the age of an individual request.
 const serverStartedAt = Date.now();
-const config = loadConfig();
+let config;
+function postgres(schema) {
+  return postgresOptions(config, schema);
+}
 let resolveClientAddress;
 let browserAuthority;
 let persistentStateGuard;
@@ -83,17 +88,33 @@ let serverOwner;
 // request while a bounded drain still has an abandoned writer in this process.
 process.once('exit', () => serverOwner?.close());
 try {
+  config = loadConfig();
   validateServerAuthConfig(config);
   browserAuthority = createBrowserAuthorityPolicy(config.browserAllowedHosts);
   serverVersion = readServerVersion(config.rootDir);
   resolveClientAddress = createClientAddressResolver(config.trustedProxyIps);
+  if (config.postgresUrl) {
+    serverOwner = new PostgresDatabase(postgres('enrich'), {
+      onDisconnect() {
+        console.error('[Pictaria] Lost the PostgreSQL ownership connection. Exiting for supervisor restart.');
+        process.exit(1);
+      },
+    });
+    const [{ acquired }] = serverOwner.request('native',
+      'SELECT pg_try_advisory_lock($1::bigint) AS acquired', [POSTGRES_OWNER_LOCK]);
+    if (!acquired) throw new Error('Another Pictaria server already owns this PostgreSQL database.');
+    console.log('[Pictaria] PostgreSQL selected. Back up the database separately from the local data directory.');
+  } else {
+    serverOwner = acquireServerOwner(config.databasePath);
+  }
+  const targets = backupTargets(config);
+  if (config.postgresUrl) targets.push(...postgresPersistentTargets(serverOwner));
   persistentStateGuard = new PersistentStateGuard({
     inventoryPath: config.persistentState.inventoryPath,
     markerPath: config.persistentState.markerPath,
     legacySettingsMarkerPath: config.persistentState.legacySettingsMarkerPath,
-    targets: backupTargets(config),
+    targets,
   });
-  serverOwner = acquireServerOwner(config.databasePath);
   persistentStateGuard.preflight();
   const upgrade = await preparePersistentStateUpgrade({
     guard: persistentStateGuard,
@@ -187,7 +208,7 @@ settingsStore.onApplied = () => {
 };
 const publicDir = join(config.rootDir, 'public');
 const taxonomy = loadActiveTaxonomy(config);
-const repo = new Repository(config.databasePath);
+const repo = new Repository(config.databasePath, postgres('enrich'));
 repo.initSchema();
 // Reconcile only at process startup, never when another reader opens the DB.
 repo.timings.interrupt();
@@ -229,11 +250,11 @@ const referee = new RefereeService({ repo, immich, review, enrichRunner, config,
 const albumStore = new SmartAlbumStore(config.albums.dataFile, { installationSecret });
 const albumScheduler = new SmartAlbumScheduler({ immich, store: albumStore, config: config.albums, enrichRepo: repo });
 const frameHub = createFrameHub();
-const frameLedger = createFrameLedger({ dbPath: config.frame.dbPath });
-const voiceMetrics = createVoiceMetrics({ dbPath: config.frame.dbPath });
+const frameLedger = createFrameLedger({ dbPath: config.frame.dbPath, postgres: postgres('frame') });
+const voiceMetrics = createVoiceMetrics({ dbPath: config.frame.dbPath, postgres: postgres('frame') });
 const wakeWordModels = new WakeWordModelStore(config.wakeWordModelsDir);
 await wakeWordModels.load();
-const insightsRepo = new InsightsRepository(config.insights.dbPath);
+const insightsRepo = new InsightsRepository(config.insights.dbPath, postgres('insights'));
 // Settings are already loaded; mirror the user's location groups into the
 // insights DB so city aggregates relabel them from the first query.
 insightsRepo.setLocationGroups(config.insights.locationGroups);

@@ -7,10 +7,9 @@ import { CurateRepository } from '../curate/repository.mjs';
 import { copyFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
+import { openDatabase } from '../database/open.mjs';
 
 import { addColumnIfMissing, migrateDatabase, tableExists } from '../migrations.mjs';
-import { preparePrivateDatabasePath, restrictPrivateDatabaseModes } from '../privateDatabase.mjs';
 import { sanitizeDiagnostic } from '../diagnostics.mjs';
 import { validateAssetBatch } from './assetBatch.mjs';
 import { EnrichTimingStore, TIMING_SCHEMA } from './timing.mjs';
@@ -612,21 +611,16 @@ function migrateManualOverrides(db, schemaSql) {
 }
 
 export class Repository {
-  constructor(databasePath) {
+  constructor(databasePath, postgres) {
     this.databasePath = String(databasePath);
-    preparePrivateDatabasePath(this.databasePath);
-    this.db = new DatabaseSync(this.databasePath);
+    this.postgres = postgres;
+    this.db = openDatabase(this.databasePath, postgres);
     this.timings = new EnrichTimingStore(this.db);
     this.aiTagSync = new AiTagSyncStore(this.db);
     this.curate = new CurateRepository(this);
     this.decisions = new DecisionRepository(this);
     this.embeddings = new EmbeddingStore(this.db);
     this.historyRetention = historyRetention();
-    this.db.exec('PRAGMA journal_mode = WAL');
-    // Decisions, tags, and captions are personal data: keep the DB (and its
-    // WAL/SHM sidecars) private to the server user even under a permissive
-    // umask. Some filesystems reject chmod — warn and continue.
-    restrictPrivateDatabaseModes(this.databasePath);
   }
 
   close() {
@@ -634,7 +628,12 @@ export class Repository {
   }
 
   initSchema() {
-    const schemaSql = readFileSync(SCHEMA_PATH, 'utf8') + TIMING_SCHEMA + DISCOVERY_SCHEMA + AI_TAG_SYNC_SCHEMA + CURATE_SCHEMA + DECISION_SCHEMA + EMBEDDING_SCHEMA;
+    let baseSchema = readFileSync(SCHEMA_PATH, 'utf8');
+    if (this.postgres) {
+      baseSchema = baseSchema.replace(/CREATE VIRTUAL TABLE IF NOT EXISTS caption_index[\s\S]*?fts5vocab[^;]+;/,
+        readFileSync(new URL('../database/postgres-captions.sql', import.meta.url), 'utf8'));
+    }
+    const schemaSql = baseSchema + TIMING_SCHEMA + DISCOVERY_SCHEMA + AI_TAG_SYNC_SCHEMA + CURATE_SCHEMA + DECISION_SCHEMA + EMBEDDING_SCHEMA;
     const result = migrateDatabase(this.db, {
       schema: schemaSql,
       migrations: ENRICH_MIGRATIONS,
@@ -668,6 +667,7 @@ export class Repository {
   }
 
   backupTo(outputPath) {
+    if (this.postgres) throw new Error('Use pg_dump to back up PostgreSQL.');
     mkdirSync(dirname(String(outputPath)), { recursive: true });
     // Checkpoint the WAL so a plain file copy is a complete snapshot.
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -712,8 +712,8 @@ export class Repository {
       return work();
     }
     const manualOverridePruneIdBefore = this.#nextManualOverridePruneId;
-    this.#inTransaction = true;
     this.db.exec('BEGIN IMMEDIATE');
+    this.#inTransaction = true;
     try {
       const result = work();
       this.db.exec('COMMIT');
@@ -1382,19 +1382,23 @@ export class Repository {
     if (tokens.length === 0) {
       return [];
     }
-    const match = tokens.map((token) => `"${token}"*`).join(' ');
+    const match = this.postgres
+      ? tokens.map((token) => `'${token}':*`).join(' & ')
+      : tokens.map((token) => `"${token}"*`).join(' ');
+    const search = this.postgres
+      ? "WHERE document @@ to_tsquery('simple', ?) ORDER BY ts_rank(document, to_tsquery('simple', ?)) DESC, asset_id"
+      : 'WHERE caption_index MATCH ? ORDER BY rank';
     const cap = Math.max(1, Math.min(Number(limit) || 100, 1000));
     return this.db
       .prepare(
         `
         SELECT asset_id, caption, short_caption
         FROM caption_index
-        WHERE caption_index MATCH ?
-        ORDER BY rank
+        ${search}
         LIMIT ?
         `,
       )
-      .all(match, cap)
+      .all(...(this.postgres ? [match, match, cap] : [match, cap]))
       .map((row) => ({ assetId: row.asset_id, caption: row.caption, shortCaption: row.short_caption }));
   }
 
@@ -2124,9 +2128,9 @@ export class Repository {
         SELECT f.asset_id, MIN(f.id) AS first_failure_id
         FROM processing_runs f
         WHERE f.status IN ('failed', 'failed_infra')
-          AND f.provider IS ? AND f.model IS ?
-          AND f.prompt_version IS ? AND f.taxonomy_version IS ?
-          AND (? IS NULL OR f.configuration_id = ?)
+          AND f.provider IS NOT DISTINCT FROM ? AND f.model IS NOT DISTINCT FROM ?
+          AND f.prompt_version IS NOT DISTINCT FROM ? AND f.taxonomy_version IS NOT DISTINCT FROM ?
+          AND (CAST(? AS TEXT) IS NULL OR f.configuration_id = ?)
           AND f.started_at >= ? AND f.started_at <= ?
           AND NOT EXISTS (
             SELECT 1 FROM processing_runs s

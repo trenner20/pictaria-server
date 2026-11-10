@@ -1,6 +1,4 @@
-import { DatabaseSync } from 'node:sqlite';
-
-import { preparePrivateDatabasePath, restrictPrivateDatabaseModes } from '../privateDatabase.mjs';
+import { openDatabase } from '../database/open.mjs';
 
 const DEFAULT_FRAME_DB_PATH = './data/frame.db';
 const DISPLAY_STATS_CHUNK_SIZE = 500;
@@ -31,6 +29,7 @@ export const DEFAULT_FRAME_DEVICE_ID = 'frame';
 export function createFrameLedger({
   dbPath = process.env.FRAME_DB_PATH || DEFAULT_FRAME_DB_PATH,
   logger = console,
+  postgres,
   retention = {},
   now = () => new Date(),
 } = {}) {
@@ -38,10 +37,7 @@ export function createFrameLedger({
   const limits = normalizeRetention(retention);
 
   try {
-    preparePrivateDatabasePath(dbPath, logger);
-    db = new DatabaseSync(dbPath);
-    db.exec('PRAGMA journal_mode = WAL');
-    restrictPrivateDatabaseModes(dbPath, logger);
+    db = openDatabase(dbPath, postgres, { logger });
     db.exec(`
       CREATE TABLE IF NOT EXISTS asset_displays (
         asset_id       TEXT NOT NULL,
@@ -100,6 +96,7 @@ export function createFrameLedger({
     } catch {
       // already closed or never opened
     }
+    if (postgres) throw error;
     return createNoopFrameLedger(limits);
   }
 

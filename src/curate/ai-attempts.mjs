@@ -50,7 +50,7 @@ export class CurateAiAttempts {
       const token = randomUUID();
       this.repo.db.prepare(`INSERT INTO curate_ai_attempts VALUES(?,?,1,'running',?)
         ON CONFLICT(role,input_key) DO UPDATE SET
-        attempts=attempts+1,state='running',token=excluded.token`).run(role, inputKey, token);
+        attempts=curate_ai_attempts.attempts+1,state='running',token=excluded.token`).run(role, inputKey, token);
       return { state: 'started', role, inputKey, token, attempts: this.status(role, inputKey).attempts };
     });
   }

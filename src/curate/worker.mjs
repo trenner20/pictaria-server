@@ -1,5 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { DatabaseSync } from 'node:sqlite';
+import { openDatabase } from '../database/open.mjs';
 import { CurateRepository } from './repository.mjs';
 import { groupPhotos } from './grouping.mjs';
 import { settledCandidateGroups } from './settled-groups.mjs';
@@ -9,7 +9,7 @@ import { applyStackChecks } from './stack-referee-results.mjs';
 // Read-only worker: source/projection writes stay on the server's existing
 // SQLite connection. One short WAL read snapshot gives the rebuild coherent
 // rows and constraints; no credentials or raw enrichment records cross threads.
-const db = new DatabaseSync(workerData.path, { readOnly: true });
+const db = openDatabase(workerData.path, workerData.postgres, { readOnly: true });
 try {
   db.exec('BEGIN');
   const store = new CurateRepository({ db });

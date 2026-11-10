@@ -1,0 +1,2167 @@
+From 8c9deab2b5670b5f91c01dc29320f27fe3ff87e0 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Mon, 9 Nov 2026 23:46:25 -0700
+Subject: [PATCH] Add optional PostgreSQL storage
+
+Signed-off-by: Codex <codex@openai.com>
+---
+ .env.example                        |   3 +
+ .github/workflows/ci.yml            |  22 ++++
+ CHANGELOG.md                        |   7 ++
+ Dockerfile                          |   4 +-
+ bin/backup.mjs                      |   3 +-
+ bin/import-sqlite.mjs               | 147 +++++++++++++++++++++++++
+ docker-compose.yml                  |   1 +
+ docs/BACKUP.md                      |  24 ++++
+ docs/CONFIGURATION.md               |   1 +
+ docs/RUNNING.md                     |  53 +++++++++
+ package-lock.json                   | 165 ++++++++++++++++++++++++++++
+ package.json                        |   3 +
+ public/settings.html                |   5 +-
+ src/backup.mjs                      |   5 +-
+ src/config.mjs                      |  15 +++
+ src/curate/ai-attempts.mjs          |   2 +-
+ src/curate/decisions.mjs            |   4 +-
+ src/curate/lab-worker.mjs           |   6 +-
+ src/curate/lab.mjs                  |   2 +-
+ src/curate/metadata.mjs             |   8 +-
+ src/curate/repository.mjs           |  12 +-
+ src/curate/schema.mjs               |   4 +-
+ src/curate/service.mjs              |   2 +-
+ src/curate/worker.mjs               |   4 +-
+ src/database/open.mjs               |  18 +++
+ src/database/postgres-captions.sql  |  12 ++
+ src/database/postgres-functions.sql |  66 +++++++++++
+ src/database/postgres-layout.mjs    |  30 +++++
+ src/database/postgres-sql.mjs       |  86 +++++++++++++++
+ src/database/postgres-worker.mjs    | 158 ++++++++++++++++++++++++++
+ src/database/postgres.mjs           | 103 +++++++++++++++++
+ src/embeddings/store.mjs            |  10 +-
+ src/enrich/aiTagSyncStore.mjs       |   2 +-
+ src/enrich/profiles.mjs             |   4 +-
+ src/enrich/repository.mjs           |  42 +++----
+ src/enrich/schema.sql               |  40 +++----
+ src/enrich/timing.mjs               |   6 +-
+ src/frame/ledger.mjs                |  11 +-
+ src/insights/repository.mjs         |  33 +++---
+ src/migrations.mjs                  |  20 +++-
+ src/persistentState.mjs             |   1 +
+ src/routes/backup.mjs               |   3 +-
+ src/server.mjs                      |  35 ++++--
+ src/voice/metrics.mjs               |  15 +--
+ test/postgres.test.mjs              | 136 +++++++++++++++++++++++
+ 45 files changed, 1211 insertions(+), 122 deletions(-)
+ create mode 100644 bin/import-sqlite.mjs
+ create mode 100644 package-lock.json
+ create mode 100644 src/database/open.mjs
+ create mode 100644 src/database/postgres-captions.sql
+ create mode 100644 src/database/postgres-functions.sql
+ create mode 100644 src/database/postgres-layout.mjs
+ create mode 100644 src/database/postgres-sql.mjs
+ create mode 100644 src/database/postgres-worker.mjs
+ create mode 100644 src/database/postgres.mjs
+ create mode 100644 test/postgres.test.mjs
+
+diff --git a/.env.example b/.env.example
+index e2361d0..f59a9e0 100644
+--- a/.env.example
++++ b/.env.example
+@@ -254,3 +254,6 @@ ALLOW_INSECURE_OPEN=false
+ #INSIGHTS_TOP_PEOPLE=15
+ #INSIGHTS_MAX_TAG_COUNTS=250
+ #INSIGHTS_STAT_CONCURRENCY=4
++
++# Optional PostgreSQL storage. Leave blank to use the default SQLite files.
++# PICTARIA_DATABASE_URL=postgresql://pictaria:password@database:5432/pictaria
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index ba5a9d9..7e14471 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -43,6 +43,28 @@ jobs:
+       - run: npm run check:publication
+       - run: npm test
+ 
++  postgres:
++    name: PostgreSQL integration
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    services:
++      postgres:
++        image: postgres:18
++        env:
++          POSTGRES_PASSWORD: postgres
++        ports:
++          - 5432/tcp
++        options: --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
++        with:
++          node-version-file: .node-version
++      - run: npm ci
++      - run: node --test test/postgres.test.mjs
++        env:
++          PICTARIA_TEST_POSTGRES_URL: postgresql://postgres:postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/postgres
++
+   upgrade-compatibility:
+     name: Upgrade compatibility
+     runs-on: ubuntu-latest
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4591417..94d72ba 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,13 @@ All notable changes to Pictaria Server are documented here. This project follows
+ 
+ ## Unreleased
+ 
++### Storage
++
++- Add optional PostgreSQL storage for Enrich, Curate, Insights, Frame and
++  voice metrics. SQLite remains the default. An offline import carries
++  existing SQLite records into a dedicated PostgreSQL database. See
++  [Running with PostgreSQL](docs/RUNNING.md#running-with-postgresql).
++
+ ### Runtime and security
+ 
+ - Move the container to Node 24.22.1 LTS, pinned to the official multi-platform
+diff --git a/Dockerfile b/Dockerfile
+index 8b8ffa9..3a4b09e 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,10 +1,10 @@
+ # Pictaria Server — single-container bundle.
+-# No runtime npm dependencies: the image is Node + the source tree.
+ FROM node:24.22.1-alpine3.24@sha256:feb76650b7195319268c59cb2d419c732d6c499b13bf5296f16ab59eb1f0a4f3
+ 
+ WORKDIR /app
+ 
+-COPY package.json ./
++COPY package.json package-lock.json ./
++RUN npm ci --omit=dev
+ COPY LICENSE ./
+ COPY src/ src/
+ COPY public/ public/
+diff --git a/bin/backup.mjs b/bin/backup.mjs
+index 80ebc81..ebc397e 100644
+--- a/bin/backup.mjs
++++ b/bin/backup.mjs
+@@ -14,8 +14,8 @@
+ import { loadConfig } from '../src/config.mjs';
+ import { adoptBackupDestination, runBackup } from '../src/backup.mjs';
+ 
+-const config = loadConfig();
+ try {
++  const config = loadConfig();
+   // --adopt: the one-time explicit trust step for a custom BACKUP_DIR —
+   // run it while the real destination is mounted; the first snapshot
+   // follows immediately.
+@@ -23,6 +23,7 @@ try {
+     console.log(`Adopted backup destination: ${adoptBackupDestination(config)}`);
+   }
+   const result = await runBackup(config);
++  if (config.postgresUrl) console.log('Local files only. Back up PostgreSQL separately.');
+   const mb = (result.bytes / 1024 / 1024).toFixed(1);
+   console.log(`Backup written: ${result.dir}`);
+   for (const file of result.files) {
+diff --git a/bin/import-sqlite.mjs b/bin/import-sqlite.mjs
+new file mode 100644
+index 0000000..74ee185
+--- /dev/null
++++ b/bin/import-sqlite.mjs
+@@ -0,0 +1,147 @@
++import { DatabaseSync } from 'node:sqlite';
++import pg from 'pg';
++
++import { acquireServerOwner } from '../src/ai/owner.mjs';
++import { loadConfig } from '../src/config.mjs';
++import { POSTGRES_OWNER_LOCK, POSTGRES_STORES, postgresOptions } from '../src/database/postgres-layout.mjs';
++import { Repository } from '../src/enrich/repository.mjs';
++import { createFrameLedger } from '../src/frame/ledger.mjs';
++import { InsightsRepository } from '../src/insights/repository.mjs';
++import { assertPrivateDatabasePath } from '../src/privateDatabase.mjs';
++import { createVoiceMetrics } from '../src/voice/metrics.mjs';
++
++const quote = (identifier) => '"' + identifier.replaceAll('"', '""') + '"';
++
++function openSource(path) {
++  assertPrivateDatabasePath(path);
++  const db = new DatabaseSync(path, { readOnly: true });
++  db.exec('BEGIN');
++  return db;
++}
++
++function initializeDestination(config) {
++  const repo = new Repository(null, postgresOptions(config, 'enrich'));
++  try {
++    repo.initSchema();
++  } finally {
++    repo.close();
++  }
++  const frame = postgresOptions(config, 'frame');
++  createFrameLedger({ postgres: frame }).close();
++  createVoiceMetrics({ postgres: frame }).close();
++  new InsightsRepository(null, postgresOptions(config, 'insights')).close();
++}
++
++async function tableDefinitions(client, schema) {
++  const { rows } = await client.query(`
++    SELECT c.relname AS name, array_agg(a.attname::text ORDER BY a.attnum) AS columns,
++           max(a.attname::text) FILTER (WHERE a.attidentity <> '') AS identity
++    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
++    JOIN pg_attribute a ON a.attrelid=c.oid
++    WHERE n.nspname=$1 AND c.relkind='r' AND a.attnum>0 AND NOT a.attisdropped
++      AND a.attgenerated='' AND c.relname <> 'pictaria_schema_version'
++    GROUP BY c.oid, c.relname
++    ORDER BY c.oid
++  `, [schema]);
++  return rows.map((row) => ({ ...row, target: `${quote(schema)}.${quote(row.name)}` }));
++}
++
++async function copyStore(client, schema, source) {
++  const tables = await tableDefinitions(client, schema);
++  await client.query(`TRUNCATE ${tables.map((table) => table.target).join(', ')}`);
++  for (const { name, columns, identity, target } of tables) {
++    const available = new Set(source.prepare('SELECT name FROM pragma_table_info(?)').all(name).map((row) => row.name));
++    if (columns.some((column) => !available.has(column))) {
++      throw new Error(`SQLite table ${name} has an older or incomplete schema. Start this version in SQLite mode once before importing.`);
++    }
++    await client.query(`ALTER TABLE ${target} DISABLE TRIGGER USER`);
++    const names = columns.map(quote).join(', ');
++    const query = source.prepare(`SELECT ${names} FROM ${quote(name)}`);
++    query.setReadBigInts(true);
++    let batch = [];
++    let highest = 0n;
++    let count = 0;
++    async function insertBatch() {
++      const tuples = batch.map((_, index) =>
++        '(' + columns.map((_, column) => `$${index * columns.length + column + 1}`).join(', ') + ')');
++      await client.query(`INSERT INTO ${target} (${names}) VALUES ${tuples.join(', ')}`, batch.flat());
++      count += batch.length;
++      batch = [];
++    }
++    for (const row of query.iterate()) {
++      batch.push(columns.map((column) => row[column] instanceof Uint8Array ? Buffer.from(row[column]) : row[column]));
++      if (identity && row[identity] > highest) highest = row[identity];
++      if (batch.length === 100) await insertBatch();
++    }
++    if (batch.length) await insertBatch();
++    if (identity) {
++      const sequence = source.prepare('SELECT seq FROM sqlite_sequence WHERE name = ?');
++      sequence.setReadBigInts(true);
++      const used = sequence.get(name)?.seq ?? 0n;
++      const next = (used > highest ? used : highest) + 1n;
++      await client.query(`ALTER TABLE ${target} ALTER COLUMN ${quote(identity)} RESTART WITH ${next}`);
++    }
++    await client.query(`ALTER TABLE ${target} ENABLE TRIGGER USER`);
++    if (count > 0) console.log(`Copied ${schema}.${name} (${count} rows)`);
++  }
++}
++
++async function importSqlite(config) {
++  if (!config.postgresUrl) throw new Error('Set PICTARIA_DATABASE_URL to a new, dedicated PostgreSQL database.');
++  const paths = [config.databasePath, config.frame.dbPath, config.insights.dbPath];
++  // Check paths before taking the SQLite server-owner lock, which may create
++  // its own separate lock file.
++  for (const path of paths) assertPrivateDatabasePath(path);
++  const owner = acquireServerOwner(config.databasePath);
++  const client = new pg.Client({ connectionString: config.postgresUrl, connectionTimeoutMillis: 5_000 });
++  client.on('error', () => { /* A pending or subsequent query reports the error. */ });
++  const sources = [];
++  let createdSchemas = false;
++  try {
++    try {
++      await client.connect();
++    } catch {
++      throw new Error('Cannot connect to the destination PostgreSQL database.');
++    }
++    const { rows: [{ acquired }] } = await client.query('SELECT pg_try_advisory_lock($1::bigint) AS acquired', [POSTGRES_OWNER_LOCK]);
++    if (!acquired) throw new Error('Stop Pictaria before importing into this PostgreSQL database.');
++    const schemas = POSTGRES_STORES.map(({ schema }) => schema);
++    const { rowCount } = await client.query('SELECT 1 FROM pg_namespace WHERE nspname=ANY($1::text[])', [schemas]);
++    if (rowCount) throw new Error('The destination already has Pictaria schemas. Use a fresh database to avoid overwriting data.');
++    for (const path of paths) sources.push(openSource(path));
++    createdSchemas = true;
++    initializeDestination(config);
++    await client.query('BEGIN');
++    try {
++      for (const [index, { schema }] of POSTGRES_STORES.entries()) {
++        await copyStore(client, schema, sources[index]);
++      }
++      await client.query('COMMIT');
++    } catch (error) {
++      await client.query('ROLLBACK');
++      throw error;
++    }
++    createdSchemas = false;
++    console.log('Import complete. Start Pictaria with the same PICTARIA_DATABASE_URL and local data directory.');
++  } catch (error) {
++    if (createdSchemas) {
++      try {
++        await client.query(`DROP SCHEMA IF EXISTS ${POSTGRES_STORES.map(({ schema }) => quote(schema)).join(', ')} CASCADE`);
++      } catch {
++        console.error('The destination could not be cleaned up. Use a new empty database for another attempt.');
++      }
++    }
++    throw error;
++  } finally {
++    for (const db of sources) db.close();
++    owner.close();
++    await client.end();
++  }
++}
++
++try {
++  await importSqlite(loadConfig());
++} catch (error) {
++  console.error(`SQLite import failed: ${error.message}`);
++  process.exitCode = 1;
++}
+diff --git a/docker-compose.yml b/docker-compose.yml
+index c69a51e..97bdda5 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -16,6 +16,7 @@ services:
+       # Strongly recommended: protects the API and web UI on your network.
+       # Blank or missing refuses to start unless the separate dangerous
+       # open-mode switch is explicitly true.
++      PICTARIA_DATABASE_URL: ${PICTARIA_DATABASE_URL:-}
+       APP_PASSWORD: ${APP_PASSWORD:-}
+       ALLOW_INSECURE_OPEN: ${ALLOW_INSECURE_OPEN:-false}
+       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+diff --git a/docs/BACKUP.md b/docs/BACKUP.md
+index 87f9fa1..b0e49cc 100644
+--- a/docs/BACKUP.md
++++ b/docs/BACKUP.md
+@@ -5,6 +5,30 @@ decisions, the AI tags and captions from enrichment runs, your album rules,
+ location groups, and settings. Your **photos are not part of this** — they
+ live in Immich and are covered by whatever backs Immich up.
+ 
++## PostgreSQL backups
++
++When `PICTARIA_DATABASE_URL` is set, Pictaria's backup UI and CLI snapshot only
++local data files. Use your database provider's backups or schedule `pg_dump`
++separately for the dedicated Pictaria database. Keep the database backup and
++the matching local snapshot together. Before a backend switch or upgrade,
++stop Pictaria while taking both so they describe the same installation state.
++
++For example, using PostgreSQL client tools that support your server version:
++
++```sh
++pg_dump --host=db.example --username=pictaria --format=custom --file=pictaria.dump pictaria
++```
++
++Restore with Pictaria stopped. Restore the local snapshot and the dump into an
++empty dedicated PostgreSQL database, then start with the restored database
++URL and local data directory.
++
++```sh
++pg_restore --host=db.example --username=pictaria --dbname=pictaria --no-owner --exit-on-error --single-transaction pictaria.dump
++```
++
++The file list and SQLite snapshot procedure below apply to SQLite mode.
++
+ ## What to back up
+ 
+ | File | Contents | Replaceable? |
+diff --git a/docs/CONFIGURATION.md b/docs/CONFIGURATION.md
+index a5f2f49..7db4c41 100644
+--- a/docs/CONFIGURATION.md
++++ b/docs/CONFIGURATION.md
+@@ -122,6 +122,7 @@ review**; their rules, albums, and manual **Run** action remain available.
+ 
+ | Variable | Default | Notes |
+ | --- | --- | --- |
++| `PICTARIA_DATABASE_URL` | Empty (SQLite) | Set a PostgreSQL connection URL to use PostgreSQL for all three database stores. See [Running with PostgreSQL](RUNNING.md#running-with-postgresql). |
+ | `DATABASE_PATH` | `data/enrichment.sqlite` | Enrichment results and review decisions — the record of truth for curation. |
+ | `ALBUMS_DATA_FILE` | `data/smart-albums.json` | Smart-album job definitions and run state. |
+ | `FRAME_DB_PATH` | `data/frame.db` | Frame display ledger (five years of recent display history, with generous per-frame and installation-wide row/byte ceilings) and voice command usage counters — both power the Frame Metrics page (`/metrics.html`). |
+diff --git a/docs/RUNNING.md b/docs/RUNNING.md
+index 8053c5e..d8993d6 100644
+--- a/docs/RUNNING.md
++++ b/docs/RUNNING.md
+@@ -14,6 +14,59 @@ you switch to the intended release and restart, the supervisor relaunches it.
+ A run that's in flight when the process stops is recorded as *interrupted* in
+ the run history; its queue item stays queued and resumes on the next run.
+ 
++## Running with PostgreSQL
++
++SQLite is the default. To select PostgreSQL, provision a dedicated PostgreSQL
++16 or newer database and give Pictaria a login that owns that database or has
++permission to create and own schemas in it. Run one Pictaria Server per database.
++Use a PostgreSQL instance on a low-latency connection because repository
++operations still use synchronous transaction boundaries.
++
++Set this in `.env` for a native or Compose installation:
++
++```dotenv
++PICTARIA_DATABASE_URL=postgresql://pictaria:password@db.example:5432/pictaria
++```
++
++URL-encode special characters in the user or password. Protect the file as
++you would other service credentials. For a native checkout, install the driver
++with `npm ci --omit=dev` before starting. If running this checkout with Compose,
++build the image with `docker compose build pictaria`. The database host must be
++reachable from the server or container. Pictaria creates the `pictaria_enrich`,
++`pictaria_frame`, and `pictaria_insights` schemas. Settings, Smart Albums, wake
++word models, and session state still use the local data directory.
++
++### Move an existing SQLite installation
++
++1. Back up the SQLite installation, then stop Pictaria. Use a fresh dedicated
++   PostgreSQL database. The import expects SQLite files initialized by this
++   version of Pictaria, so start this version once in SQLite mode first if
++   upgrading from an older release.
++2. Set `PICTARIA_DATABASE_URL` and keep the original data directory and SQLite
++   paths configured. Run the import once, with the server stopped.
++
++   Native:
++
++   ```sh
++   node --env-file-if-exists=.env bin/import-sqlite.mjs
++   ```
++
++   Docker Compose:
++
++   ```sh
++   docker compose build pictaria
++   docker compose run --rm --no-deps pictaria node bin/import-sqlite.mjs
++   ```
++
++3. Start Pictaria with the same URL and data directory. The import preserves
++   the SQLite databases and refuses a destination that already has Pictaria
++   schemas. Removing the URL and restarting returns to the retained SQLite
++   databases. Any writes made after the switch stay in PostgreSQL.
++
++In PostgreSQL mode, Pictaria's built-in snapshots cover the local files.
++Schedule a PostgreSQL backup separately and restore it together with the local
++files. See [PostgreSQL backups](BACKUP.md#postgresql-backups).
++
+ ## Docker with a VPN-owned host address
+ 
+ The stock compose file publishes `4080:4080` on the host without depending on
+diff --git a/package-lock.json b/package-lock.json
+new file mode 100644
+index 0000000..bbf4861
+--- /dev/null
++++ b/package-lock.json
+@@ -0,0 +1,165 @@
++{
++  "name": "pictaria-server",
++  "version": "1.2.1",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "pictaria-server",
++      "version": "1.2.1",
++      "license": "AGPL-3.0-only",
++      "dependencies": {
++        "pg": "^8.23.1"
++      },
++      "engines": {
++        "node": "^22.16.0 || >=23.8.0"
++      }
++    },
++    "node_modules/pg": {
++      "version": "8.23.1",
++      "resolved": "https://registry.npmjs.org/pg/-/pg-8.23.1.tgz",
++      "integrity": "sha512-aL96AHANtWjPLDOLqnhx+ngp9+UK7ETEU8VJrDCGvsSSi/mGLcWYsS6Herg7lmaBJe4uwrfqsa7gTEFaSizDoQ==",
++      "license": "MIT",
++      "dependencies": {
++        "pg-connection-string": "^2.14.1",
++        "pg-pool": "^3.14.0",
++        "pg-protocol": "^1.16.1",
++        "pg-types": "2.2.0",
++        "pgpass": "1.0.5"
++      },
++      "engines": {
++        "node": ">= 16.0.0"
++      },
++      "optionalDependencies": {
++        "pg-cloudflare": "^1.4.1"
++      },
++      "peerDependencies": {
++        "pg-native": ">=3.0.1"
++      },
++      "peerDependenciesMeta": {
++        "pg-native": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/pg-cloudflare": {
++      "version": "1.4.1",
++      "resolved": "https://registry.npmjs.org/pg-cloudflare/-/pg-cloudflare-1.4.1.tgz",
++      "integrity": "sha512-6PQbsFWZcp9EmJEwy5cGQ2La+AMWpP46lgbb8X+U/XsHIUweYDNCpeuKck5RxL2MdVFi7krbbEi5nX4Zh7JhrQ==",
++      "license": "MIT",
++      "optional": true
++    },
++    "node_modules/pg-connection-string": {
++      "version": "2.14.1",
++      "resolved": "https://registry.npmjs.org/pg-connection-string/-/pg-connection-string-2.14.1.tgz",
++      "integrity": "sha512-qR3kGNPBLpCNtz0evbKA0Y/MRFXwSSdT+pTJvYp/bXTcReZbvX1kzF0IyTc1QnxqF7AZbOeBhNL8R5mYQZV/MA==",
++      "license": "MIT"
++    },
++    "node_modules/pg-int8": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/pg-int8/-/pg-int8-1.0.1.tgz",
++      "integrity": "sha512-WCtabS6t3c8SkpDBUlb1kjOs7l66xsGdKpIPZsg4wR+B3+u9UAum2odSsF9tnvxg80h4ZxLWMy4pRjOsFIqQpw==",
++      "license": "ISC",
++      "engines": {
++        "node": ">=4.0.0"
++      }
++    },
++    "node_modules/pg-pool": {
++      "version": "3.14.0",
++      "resolved": "https://registry.npmjs.org/pg-pool/-/pg-pool-3.14.0.tgz",
++      "integrity": "sha512-gKtPkFdQPU3DksooVLi9LsjZxrsBUZIpa+7aVx+LV5pNh0KzP4Zleud2po+ConrxbuXGBJ6Hfer6hdgpIBpBaw==",
++      "license": "MIT",
++      "peerDependencies": {
++        "pg": ">=8.0"
++      }
++    },
++    "node_modules/pg-protocol": {
++      "version": "1.16.1",
++      "resolved": "https://registry.npmjs.org/pg-protocol/-/pg-protocol-1.16.1.tgz",
++      "integrity": "sha512-p9VOFMiHB/ZbJATetbg+99PxssTVSQRnyuPSQ67mN1+1KBOjZaZ83ZQzltnxPhJwSsC3nwVjJ10DVJlerbFzLg==",
++      "license": "MIT"
++    },
++    "node_modules/pg-types": {
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/pg-types/-/pg-types-2.2.0.tgz",
++      "integrity": "sha512-qTAAlrEsl8s4OiEQY69wDvcMIdQN6wdz5ojQiOy6YRMuynxenON0O5oCpJI6lshc6scgAY8qvJ2On/p+CXY0GA==",
++      "license": "MIT",
++      "dependencies": {
++        "pg-int8": "1.0.1",
++        "postgres-array": "~2.0.0",
++        "postgres-bytea": "~1.0.0",
++        "postgres-date": "~1.0.4",
++        "postgres-interval": "^1.1.0"
++      },
++      "engines": {
++        "node": ">=4"
++      }
++    },
++    "node_modules/pgpass": {
++      "version": "1.0.5",
++      "resolved": "https://registry.npmjs.org/pgpass/-/pgpass-1.0.5.tgz",
++      "integrity": "sha512-FdW9r/jQZhSeohs1Z3sI1yxFQNFvMcnmfuj4WBMUTxOrAyLMaTcE1aAMBiTlbMNaXvBCQuVi0R7hd8udDSP7ug==",
++      "license": "MIT",
++      "dependencies": {
++        "split2": "^4.1.0"
++      }
++    },
++    "node_modules/postgres-array": {
++      "version": "2.0.0",
++      "resolved": "https://registry.npmjs.org/postgres-array/-/postgres-array-2.0.0.tgz",
++      "integrity": "sha512-VpZrUqU5A69eQyW2c5CA1jtLecCsN2U/bD6VilrFDWq5+5UIEVO7nazS3TEcHf1zuPYO/sqGvUvW62g86RXZuA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=4"
++      }
++    },
++    "node_modules/postgres-bytea": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/postgres-bytea/-/postgres-bytea-1.0.1.tgz",
++      "integrity": "sha512-5+5HqXnsZPE65IJZSMkZtURARZelel2oXUEO8rH83VS/hxH5vv1uHquPg5wZs8yMAfdv971IU+kcPUczi7NVBQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/postgres-date": {
++      "version": "1.0.7",
++      "resolved": "https://registry.npmjs.org/postgres-date/-/postgres-date-1.0.7.tgz",
++      "integrity": "sha512-suDmjLVQg78nMK2UZ454hAG+OAW+HQPZ6n++TNDUX+L0+uUlLywnoxJKDou51Zm+zTCjrCl0Nq6J9C5hP9vK/Q==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/postgres-interval": {
++      "version": "1.2.0",
++      "resolved": "https://registry.npmjs.org/postgres-interval/-/postgres-interval-1.2.0.tgz",
++      "integrity": "sha512-9ZhXKM/rw350N1ovuWHbGxnGh/SNJ4cnxHiM0rxE4VN41wsg8P8zWn9hv/buK00RP4WvlOyr/RBDiptyxVbkZQ==",
++      "license": "MIT",
++      "dependencies": {
++        "xtend": "^4.0.0"
++      },
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/split2": {
++      "version": "4.2.0",
++      "resolved": "https://registry.npmjs.org/split2/-/split2-4.2.0.tgz",
++      "integrity": "sha512-UcjcJOWknrNkF6PLX83qcHM6KHgVKNkV62Y8a5uYDVv9ydGQVwAHMKqHdJje1VTWpljG0WYpCDhrCdAOYH4TWg==",
++      "license": "ISC",
++      "engines": {
++        "node": ">= 10.x"
++      }
++    },
++    "node_modules/xtend": {
++      "version": "4.0.2",
++      "resolved": "https://registry.npmjs.org/xtend/-/xtend-4.0.2.tgz",
++      "integrity": "sha512-LKYU1iAXJXUgAXn9URjiu+MWhyUXHsvfp7mcuYm9dSUKK0/CjtrUwFAxD82/mCWbtLsGjFIad0wIsod4zrTAEQ==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.4"
++      }
++    }
++  }
++}
+diff --git a/package.json b/package.json
+index 2152254..0142e78 100644
+--- a/package.json
++++ b/package.json
+@@ -13,5 +13,8 @@
+     "check:publication": "node scripts/check-publication.mjs",
+     "start": "node --env-file-if-exists=.env src/server.mjs",
+     "test": "node --test"
++  },
++  "dependencies": {
++    "pg": "^8.23.1"
+   }
+ }
+diff --git a/public/settings.html b/public/settings.html
+index 4ca8482..4271697 100644
+--- a/public/settings.html
++++ b/public/settings.html
+@@ -1700,6 +1700,7 @@
+       }
+       el('backupStatusLine').textContent = [
+         `Destination: ${status.dir}`,
++        status.postgresBackupRequired ? 'Local files only. Back up PostgreSQL separately.' : null,
+         `${status.count} snapshot${status.count === 1 ? '' : 's'} kept`,
+         status.lastAt ? `newest ${new Date(status.lastAt).toLocaleString()}` : 'none yet',
+         status.lastResult?.complete === false
+@@ -1721,7 +1722,9 @@
+         if (!response.ok) throw new Error(body?.error?.message ?? 'Backup failed');
+         el('note-backup').textContent = body.complete === false
+           ? `Backup incomplete — missing ${(body.missing ?? []).map((entry) => entry.name).join(', ')}. Older complete snapshots were preserved.`
+-          : `Backed up ${(body.bytes / 1024 / 1024).toFixed(1)} MB (${body.files.length} files).`;
++          : body.postgresBackupRequired
++            ? 'Local files backed up. Back up PostgreSQL separately.'
++            : `Backed up ${(body.bytes / 1024 / 1024).toFixed(1)} MB (${body.files.length} files).`;
+         void loadBackupStatus();
+       } catch (error) {
+         el('note-backup').textContent = error.message;
+diff --git a/src/backup.mjs b/src/backup.mjs
+index d576520..00d5b1b 100644
+--- a/src/backup.mjs
++++ b/src/backup.mjs
+@@ -61,7 +61,7 @@ import { writePrivateFileAtomicSync } from './atomicFile.mjs';
+ // one with the other while reporting both as backed up. Roles match the
+ // default basenames so existing snapshots stay recognizable and restorable.
+ export function backupTargets(config) {
+-  return [
++  const sqliteTargets = [
+     {
+       role: 'enrichment.sqlite',
+       path: config.databasePath,
+@@ -80,6 +80,9 @@ export function backupTargets(config) {
+       kind: 'sqlite',
+       validate: validateSqlitePersistentState,
+     },
++  ];
++  return [
++    ...(config.postgresUrl ? [] : sqliteTargets),
+     {
+       role: 'settings.json',
+       path: config.settingsPath,
+diff --git a/src/config.mjs b/src/config.mjs
+index 06e39e7..69ad400 100644
+--- a/src/config.mjs
++++ b/src/config.mjs
+@@ -7,6 +7,20 @@ import { DEFAULT_EMBEDDING_MODEL, normalizeEmbeddingModel, validEmbeddingModel }
+ 
+ const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+ 
++function postgresUrl(env) {
++  const url = env.PICTARIA_DATABASE_URL?.trim();
++  if (!url) return null;
++  try {
++    const parsed = new URL(url);
++    if (['postgres:', 'postgresql:'].includes(parsed.protocol) && parsed.hostname && parsed.pathname.length > 1) {
++      return url;
++    }
++  } catch {
++    // Never print the connection string, which can contain credentials.
++  }
++  throw new Error('PICTARIA_DATABASE_URL must be a PostgreSQL URL with a host and database name.');
++}
++
+ export function loadConfig(env = process.env) {
+   const settingsPath = resolvePath(env.SETTINGS_PATH, join(ROOT_DIR, 'data', 'settings.json'));
+   const persistentStateInventoryPath = join(dirname(settingsPath), 'persistent-state.json');
+@@ -36,6 +50,7 @@ export function loadConfig(env = process.env) {
+     immichPublicUrl: normalizeBaseUrl(env.IMMICH_PUBLIC_URL || env.IMMICH_BASE_URL || ''),
+     immichApiKey: env.IMMICH_API_KEY || '',
+     requestTimeoutMs: parseInteger(env.REQUEST_TIMEOUT_MS, 60000),
++    postgresUrl: postgresUrl(env),
+     databasePath: resolvePath(env.DATABASE_PATH, join(ROOT_DIR, 'data', 'enrichment.sqlite')),
+     settingsPath,
+     persistentState: {
+diff --git a/src/curate/ai-attempts.mjs b/src/curate/ai-attempts.mjs
+index 7b3f984..9ce0e06 100644
+--- a/src/curate/ai-attempts.mjs
++++ b/src/curate/ai-attempts.mjs
+@@ -50,7 +50,7 @@ export class CurateAiAttempts {
+       const token = randomUUID();
+       this.repo.db.prepare(`INSERT INTO curate_ai_attempts VALUES(?,?,1,'running',?)
+         ON CONFLICT(role,input_key) DO UPDATE SET
+-        attempts=attempts+1,state='running',token=excluded.token`).run(role, inputKey, token);
++        attempts=curate_ai_attempts.attempts+1,state='running',token=excluded.token`).run(role, inputKey, token);
+       return { state: 'started', role, inputKey, token, attempts: this.status(role, inputKey).attempts };
+     });
+   }
+diff --git a/src/curate/decisions.mjs b/src/curate/decisions.mjs
+index e4e5379..08ebaaf 100644
+--- a/src/curate/decisions.mjs
++++ b/src/curate/decisions.mjs
+@@ -66,7 +66,7 @@ export class DecisionRepository {
+     });
+   }
+   pendingFor(assetId) {
+-    return this.db.prepare(`SELECT * FROM decision_intents WHERE asset_id=? AND synced_revision IS NOT revision ORDER BY tag`).all(assetId);
++    return this.db.prepare(`SELECT * FROM decision_intents WHERE asset_id=? AND synced_revision IS DISTINCT FROM revision ORDER BY tag`).all(assetId);
+   }
+   acknowledge(rows) {
+     this.repo.transaction(() => {
+@@ -271,7 +271,7 @@ export class DecisionRepository {
+         WHERE settled_at IS NULL AND id>? ORDER BY id LIMIT 100`).all(this.pruneCursor);
+       for (const {id} of candidates) {
+         this.db.prepare(`UPDATE decision_operations SET settled_at=? WHERE id=? AND NOT EXISTS (
+-          SELECT 1 FROM decision_operation_members m, json_each(m.scope_json) t
++          SELECT 1 FROM decision_operation_members m CROSS JOIN json_each(m.scope_json) t
+           JOIN decision_intents i ON i.asset_id=m.asset_id AND i.tag=t.value
+           WHERE m.operation_id=? AND i.revision=? AND i.synced_revision IS NOT i.revision
+         ) AND NOT EXISTS(SELECT 1 FROM decision_sync_links WHERE operation_id=?)`).run(now,id,id,id,id);
+diff --git a/src/curate/lab-worker.mjs b/src/curate/lab-worker.mjs
+index 01ec99e..b046f67 100644
+--- a/src/curate/lab-worker.mjs
++++ b/src/curate/lab-worker.mjs
+@@ -1,16 +1,16 @@
+ import { parentPort, workerData } from 'node:worker_threads';
+-import { DatabaseSync } from 'node:sqlite';
++import { openDatabase } from '../database/open.mjs';
+ import { timeGroups } from '../../public/curate/stacking-model.js';
+ import { CurateRepository } from './repository.mjs';
+ import { labPeopleEvidence, labRecognizedIds } from './lab-evidence.mjs';
+ 
+ // Only cached evidence crosses this boundary; no credentials or provider calls.
+-const db = new DatabaseSync(workerData.path, { readOnly: true });
++const db = openDatabase(workerData.path, workerData.postgres, { readOnly: true });
+ try {
+   db.exec('BEGIN');
+   const store = new CurateRepository({ db });
+   const rows = db.prepare(`SELECT p.asset_id id,p.captured_ms time,
+-    p.recognized_count recognizedCount,p.availability,pr.configuration_id,
++    p.recognized_count AS "recognizedCount",p.availability,pr.configuration_id,
+     CASE WHEN length(json_extract(p.evidence_json,'$.recognition'))<=4096
+       THEN json_extract(p.evidence_json,'$.recognition') ELSE NULL END recognition,
+     json_extract(pr.normalized_output_json,'$.people_count') people_count,
+diff --git a/src/curate/lab.mjs b/src/curate/lab.mjs
+index 9eba4a9..91549c0 100644
+--- a/src/curate/lab.mjs
++++ b/src/curate/lab.mjs
+@@ -23,7 +23,7 @@ export class StackingLab {
+       if (this.closed) throw Error('The stacking lab is stopping.');
+       const result = await new Promise((resolve, reject) => {
+         const worker = new Worker(new URL('./lab-worker.mjs', import.meta.url), {
+-          workerData: { path: this.curate.repo.databasePath, gapMs: gapSeconds * 1000, sort }, execArgv: [],
++          workerData: { path: this.curate.repo.databasePath, postgres: this.curate.repo.postgres, gapMs: gapSeconds * 1000, sort }, execArgv: [],
+         });
+         this.worker = worker;
+         let message;
+diff --git a/src/curate/metadata.mjs b/src/curate/metadata.mjs
+index 008a446..a03a4ca 100644
+--- a/src/curate/metadata.mjs
++++ b/src/curate/metadata.mjs
+@@ -80,10 +80,10 @@ export class CurateMetadataStore {
+     this.prepare(
+       `INSERT INTO curate_metadata(asset_id,source_key,priority) VALUES(?,?,?)
+       ON CONFLICT(asset_id) DO UPDATE SET
+-      priority=CASE WHEN excluded.priority=1 THEN 1 WHEN context_until>? AND (next_at<=? OR source_key IS NOT excluded.source_key) THEN 2 ELSE 0 END,
+-      next_at=CASE WHEN source_key IS NOT excluded.source_key
+-        THEN MIN(next_at,MAX(?,COALESCE(last_attempt_at,0)+?)) ELSE next_at END,
+-      outcome=CASE WHEN source_key IS NOT excluded.source_key THEN 'pending' ELSE outcome END,
++      priority=CASE WHEN excluded.priority=1 THEN 1 WHEN curate_metadata.context_until>? AND (curate_metadata.next_at<=? OR curate_metadata.source_key IS NOT excluded.source_key) THEN 2 ELSE 0 END,
++      next_at=CASE WHEN curate_metadata.source_key IS NOT excluded.source_key
++        THEN MIN(curate_metadata.next_at,MAX(?,COALESCE(curate_metadata.last_attempt_at,0)+?)) ELSE curate_metadata.next_at END,
++      outcome=CASE WHEN curate_metadata.source_key IS NOT excluded.source_key THEN 'pending' ELSE curate_metadata.outcome END,
+       source_key=excluded.source_key`,
+     ).run(id, key, state === 'undecided' ? 1 : 0, now, now, now, METADATA_LIMITS.minIntervalMs);
+   }
+diff --git a/src/curate/repository.mjs b/src/curate/repository.mjs
+index 071576b..e21115a 100644
+--- a/src/curate/repository.mjs
++++ b/src/curate/repository.mjs
+@@ -12,8 +12,8 @@ export const LEASE_MS = 30 * 60_000;
+ export const MAX_LEASES = 200;
+ export const MAX_VIEW_LEASES = 200;
+ export const MAX_LEASE_BYTES = 5 * 1024 * 1024;
+-const HOT = `asset_id id,captured_ms time,checksum,duplicate_id duplicateId,rendition_key renditionKey,
+- input_key inputKey,material_key materialKey,people_count peopleCount,recognized_count recognizedCount,availability`;
++const HOT = `asset_id id,captured_ms time,checksum,duplicate_id AS "duplicateId",rendition_key AS "renditionKey",
++ input_key AS "inputKey",material_key AS "materialKey",people_count AS "peopleCount",recognized_count AS "recognizedCount",availability`;
+ 
+ export class CurateRepository {
+   constructor(repo) {
+@@ -206,12 +206,12 @@ export class CurateRepository {
+   }
+   pending() {
+     return this.prepare(
+-      `SELECT asset_id id,captured_ms time,checksum,duplicate_id duplicateId,rendition_key renditionKey,people_count peopleCount,recognized_count recognizedCount,availability FROM curate_photos WHERE state='undecided' ORDER BY captured_ms,asset_id`,
++      `SELECT asset_id id,captured_ms time,checksum,duplicate_id AS "duplicateId",rendition_key AS "renditionKey",people_count AS "peopleCount",recognized_count AS "recognizedCount",availability FROM curate_photos WHERE state='undecided' ORDER BY captured_ms,asset_id`,
+     ).all();
+   }
+   candidateRows() {
+     return this.prepare(`SELECT ${HOT},
+-      json_extract(evidence_json,'$.category.peopleCategory') peopleCategory,
++      json_extract(evidence_json,'$.category.peopleCategory') AS "peopleCategory",
+       json_extract(evidence_json,'$.recognition') recognition,
+       json_extract(evidence_json,'$.image.thumbhash') thumbhash
+       FROM curate_photos WHERE state='undecided' ORDER BY captured_ms,asset_id`).all();
+@@ -237,7 +237,7 @@ export class CurateRepository {
+       WHERE m.asset_id=? ORDER BY m.separation_id`).all(id));
+   }
+   photo(id) {
+-    return this.prepare(`SELECT ${HOT},state,human_key humanKey FROM curate_photos WHERE asset_id=?`).get(id);
++    return this.prepare(`SELECT ${HOT},state,human_key AS "humanKey" FROM curate_photos WHERE asset_id=?`).get(id);
+   }
+   details(ids) {
+     return ids.map((id) => {
+@@ -273,7 +273,7 @@ export class CurateRepository {
+   corrections(offset = 0, limit = 50) {
+     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 50)
+       throw new CurateError('Invalid corrections page.', 'invalid_curate_query', 400);
+-    const rows = this.prepare(`SELECT id,revision,created_at createdAt FROM curate_separations
++    const rows = this.prepare(`SELECT id,revision,created_at AS "createdAt" FROM curate_separations
+       WHERE active=1 ORDER BY created_at DESC,id LIMIT ? OFFSET ?`).all(limit + 1, offset);
+     return {
+       corrections: rows.slice(0, limit).map(row => ({ ...row, active: true,
+diff --git a/src/curate/schema.mjs b/src/curate/schema.mjs
+index 93405a0..1c3c2ba 100644
+--- a/src/curate/schema.mjs
++++ b/src/curate/schema.mjs
+@@ -131,14 +131,14 @@ export function installCurateTriggers(db) {
+         table === 'review_list' ? '1' : `EXISTS(SELECT 1 FROM review_list WHERE asset_id=${ref}.asset_id)`;
+       const changed =
+         table === 'assets' && event === 'UPDATE'
+-          ? ` AND (${projectionColumns.map((column) => `NEW.${column} IS NOT OLD.${column}`).join(' OR ') || '0'})`
++          ? ` AND (${projectionColumns.map((column) => `NEW.${column} IS NOT OLD.${column}`).join(' OR ') || 'FALSE'})`
+           : '';
+       // Replace the definition on boot, including existing development databases.
+       db.exec(`DROP TRIGGER IF EXISTS curate_${table}_${event.toLowerCase()};
+         CREATE TRIGGER curate_${table}_${event.toLowerCase()}
+         AFTER ${event} ON ${table} WHEN ${relevant}${changed} BEGIN
+         INSERT INTO curate_dirty(asset_id,version) VALUES(${ref}.asset_id,1)
+-          ON CONFLICT(asset_id) DO UPDATE SET version=version+1;
++          ON CONFLICT(asset_id) DO UPDATE SET version=curate_dirty.version+1;
+         END;`);
+     }
+   }
+diff --git a/src/curate/service.mjs b/src/curate/service.mjs
+index 1e84d53..f47d65e 100644
+--- a/src/curate/service.mjs
++++ b/src/curate/service.mjs
+@@ -93,7 +93,7 @@ export class CurateService {
+     } else
+       result = await new Promise((resolve, reject) => {
+         const worker = new Worker(new URL('./worker.mjs', import.meta.url), {
+-          workerData: { path: this.repo.databasePath, stacks, candidate: this.candidateEnabled, rankConnection: this.refinement?.connection,
++          workerData: { path: this.repo.databasePath, postgres: this.repo.postgres, stacks, candidate: this.candidateEnabled, rankConnection: this.refinement?.connection,
+             embeddings: embeddingPolicy },
+           // Server/test-runner flags (including --input-type) need not be valid worker flags.
+           execArgv: [],
+diff --git a/src/curate/worker.mjs b/src/curate/worker.mjs
+index b83d8c8..d3d4c85 100644
+--- a/src/curate/worker.mjs
++++ b/src/curate/worker.mjs
+@@ -1,5 +1,5 @@
+ import { parentPort, workerData } from 'node:worker_threads';
+-import { DatabaseSync } from 'node:sqlite';
++import { openDatabase } from '../database/open.mjs';
+ import { CurateRepository } from './repository.mjs';
+ import { groupPhotos } from './grouping.mjs';
+ import { settledCandidateGroups } from './settled-groups.mjs';
+@@ -9,7 +9,7 @@ import { applyStackChecks } from './stack-referee-results.mjs';
+ // Read-only worker: source/projection writes stay on the server's existing
+ // SQLite connection. One short WAL read snapshot gives the rebuild coherent
+ // rows and constraints; no credentials or raw enrichment records cross threads.
+-const db = new DatabaseSync(workerData.path, { readOnly: true });
++const db = openDatabase(workerData.path, workerData.postgres, { readOnly: true });
+ try {
+   db.exec('BEGIN');
+   const store = new CurateRepository({ db });
+diff --git a/src/database/open.mjs b/src/database/open.mjs
+new file mode 100644
+index 0000000..dab9c32
+--- /dev/null
++++ b/src/database/open.mjs
+@@ -0,0 +1,18 @@
++import { DatabaseSync } from 'node:sqlite';
++import { PostgresDatabase } from './postgres.mjs';
++import { preparePrivateDatabasePath, restrictPrivateDatabaseModes } from '../privateDatabase.mjs';
++
++export function openDatabase(path, postgres, { readOnly = false, logger = console } = {}) {
++  if (postgres) return new PostgresDatabase(postgres, { readOnly });
++  if (readOnly) return new DatabaseSync(path, { readOnly });
++  preparePrivateDatabasePath(path, logger);
++  const db = new DatabaseSync(path);
++  try {
++    db.exec('PRAGMA journal_mode = WAL');
++    restrictPrivateDatabaseModes(path, logger);
++    return db;
++  } catch (error) {
++    db.close();
++    throw error;
++  }
++}
+diff --git a/src/database/postgres-captions.sql b/src/database/postgres-captions.sql
+new file mode 100644
+index 0000000..573d772
+--- /dev/null
++++ b/src/database/postgres-captions.sql
+@@ -0,0 +1,12 @@
++CREATE TABLE IF NOT EXISTS caption_index (
++  asset_id text PRIMARY KEY,
++  caption text,
++  short_caption text,
++  document tsvector GENERATED ALWAYS AS
++    (to_tsvector('simple', coalesce(caption, '') || ' ' || coalesce(short_caption, ''))) STORED
++);
++CREATE INDEX IF NOT EXISTS idx_caption_index_document ON caption_index USING gin(document);
++CREATE OR REPLACE VIEW caption_vocab AS
++  SELECT term, count(*) AS doc
++  FROM caption_index CROSS JOIN LATERAL unnest(tsvector_to_array(document)) AS term
++  GROUP BY term;
+diff --git a/src/database/postgres-functions.sql b/src/database/postgres-functions.sql
+new file mode 100644
+index 0000000..9fbf53e
+--- /dev/null
++++ b/src/database/postgres-functions.sql
+@@ -0,0 +1,66 @@
++CREATE OR REPLACE FUNCTION pictaria_json_value(value text, path text)
++RETURNS jsonb LANGUAGE sql IMMUTABLE STRICT SET search_path FROM CURRENT AS $$
++  SELECT value::jsonb #> string_to_array(substr(path, 3), '.')
++$$;
++
++CREATE OR REPLACE FUNCTION json_extract(value text, path text)
++RETURNS text LANGUAGE sql IMMUTABLE STRICT SET search_path FROM CURRENT AS $$
++  SELECT pictaria_json_value(value, path) #>> '{}'
++$$;
++
++CREATE OR REPLACE FUNCTION pictaria_json_number(value text, path text)
++RETURNS bigint LANGUAGE sql IMMUTABLE STRICT SET search_path FROM CURRENT AS $$
++  SELECT CASE jsonb_typeof(item)
++    WHEN 'boolean' THEN CASE WHEN item = 'true'::jsonb THEN 1 ELSE 0 END
++    WHEN 'number' THEN (item #>> '{}')::numeric::bigint
++    END
++  FROM pictaria_json_value(value, path) item
++$$;
++
++CREATE OR REPLACE FUNCTION json_type(value text, path text)
++RETURNS text LANGUAGE sql IMMUTABLE STRICT SET search_path FROM CURRENT AS $$
++  SELECT CASE jsonb_typeof(item)
++    WHEN 'boolean' THEN item #>> '{}'
++    WHEN 'number' THEN CASE WHEN (item #>> '{}') ~ '^-?[0-9]+$' THEN 'integer' ELSE 'real' END
++    WHEN 'string' THEN 'text'
++    ELSE jsonb_typeof(item) END
++  FROM pictaria_json_value(value, path) item
++$$;
++
++CREATE OR REPLACE FUNCTION json_valid(value text)
++RETURNS boolean LANGUAGE plpgsql IMMUTABLE STRICT SET search_path FROM CURRENT AS $$
++BEGIN
++  PERFORM value::jsonb;
++  RETURN true;
++EXCEPTION WHEN data_exception THEN
++  RETURN false;
++END
++$$;
++
++CREATE OR REPLACE FUNCTION json_set(value text, path text, replacement bigint)
++RETURNS text LANGUAGE sql IMMUTABLE STRICT SET search_path FROM CURRENT AS $$
++  SELECT jsonb_set(value::jsonb, string_to_array(substr(path, 3), '.'), to_jsonb(replacement))::text
++$$;
++
++CREATE OR REPLACE FUNCTION julianday(value text)
++RETURNS double precision LANGUAGE plpgsql IMMUTABLE STRICT
++SET TimeZone = 'UTC' SET DateStyle = 'ISO, YMD' AS $$
++BEGIN
++  RETURN extract(epoch FROM (value::timestamptz)) / 86400 + 2440587.5;
++EXCEPTION WHEN data_exception THEN
++  RETURN NULL;
++END
++$$;
++
++CREATE OR REPLACE FUNCTION strftime(format text, value text)
++RETURNS text LANGUAGE plpgsql IMMUTABLE STRICT SET DateStyle = 'ISO, YMD' AS $$
++BEGIN
++  IF format <> '%Y-%m-%d' OR value !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN
++    RETURN NULL;
++  END IF;
++  RETURN to_char(value::date, 'YYYY-MM-DD');
++EXCEPTION WHEN data_exception THEN
++  RETURN NULL;
++END
++$$;
++
+diff --git a/src/database/postgres-layout.mjs b/src/database/postgres-layout.mjs
+new file mode 100644
+index 0000000..b2b4f58
+--- /dev/null
++++ b/src/database/postgres-layout.mjs
+@@ -0,0 +1,30 @@
++export const POSTGRES_OWNER_LOCK = '78097489725420641';
++
++export const POSTGRES_STORES = [
++  { role: 'enrichment.sqlite', schema: 'pictaria_enrich', required: ['assets', 'processing_runs', 'asset_tags', 'pictaria_schema_version'] },
++  { role: 'frame.db', schema: 'pictaria_frame', required: ['asset_displays', 'voice_command_stats'] },
++  { role: 'insights.sqlite', schema: 'pictaria_insights', required: ['swept_assets', 'pictaria_schema_version'] },
++];
++
++export function postgresOptions(config, store) {
++  return config.postgresUrl ? { url: config.postgresUrl, schema: `pictaria_${store}` } : undefined;
++}
++
++export function postgresPersistentTargets(owner) {
++  return POSTGRES_STORES.map(({ role, schema, required }) => ({
++    role,
++    path: `PostgreSQL schema ${schema}`,
++    kind: 'postgres',
++    inspect() {
++      const [{ present }] = owner.request('native', `
++        SELECT count(*) = cardinality($2::text[]) AS present
++        FROM information_schema.tables
++        WHERE table_schema = $1 AND table_name = ANY($2::text[])
++      `, [schema, required]);
++      return present ? { valid: true } : {
++        valid: false,
++        reason: 'required PostgreSQL tables are missing. Import the SQLite databases or restore PostgreSQL before restarting',
++      };
++    },
++  }));
++}
+diff --git a/src/database/postgres-sql.mjs b/src/database/postgres-sql.mjs
+new file mode 100644
+index 0000000..a1d13e2
+--- /dev/null
++++ b/src/database/postgres-sql.mjs
+@@ -0,0 +1,86 @@
++// The repositories share SQL with SQLite. Keep the dialect differences here,
++// while leaving storage algorithms, transaction boundaries and bindings in
++// the repositories. All input is repository SQL. User values stay parameters.
++const TOKEN = /'(?:''|[^'])*'|"(?:""|[^"])*"|--[^\n]*|\/\*[\s\S]*?\*\/|[a-z_][\w]*|[^\s]|\s+/gi;
++
++function tokens(sql) {
++  return [...sql.matchAll(TOKEN)].map(([token]) => token);
++}
++
++export function statements(sql) {
++  const result = [];
++  let statement = '';
++  for (const token of tokens(sql)) {
++    if (token === ';') {
++      if (statement.trim()) result.push(statement.trim());
++      statement = '';
++    } else if (!token.startsWith('--') && !token.startsWith('/*')) {
++      statement += token;
++    }
++  }
++  if (statement.trim()) result.push(statement.trim());
++  return result;
++}
++
++function translateFunctions(sql) {
++  const parts = tokens(sql);
++  const calls = [];
++  let last = -1;
++  for (const [index, token] of parts.entries()) {
++    if (!token.trim()) continue;
++    if (token === '(') calls.push(last);
++    if (token === ')') {
++      const call = calls.pop();
++      if (/^json_object$/i.test(parts[call])) {
++        parts[call] = 'json_build_object';
++        parts[index] += '::text';
++      }
++    }
++    if (token === ',') {
++      const call = calls.at(-1);
++      if (/^min$/i.test(parts[call])) parts[call] = 'LEAST';
++      if (/^max$/i.test(parts[call])) parts[call] = 'GREATEST';
++    }
++    last = index;
++  }
++  return parts.join('');
++}
++
++export function postgresSql(sql) {
++  const columns = /^(?:SELECT name FROM pragma_table_info\(([^)]+)\)|PRAGMA table_info\((\w+)\))$/i.exec(sql);
++  if (columns) {
++    sql = 'SELECT column_name AS name FROM information_schema.columns '
++      + `WHERE table_schema = current_schema() AND table_name = ${columns[1] ?? `'${columns[2]}'`} ORDER BY ordinal_position`;
++  }
++  sql = sql
++    .replace(/\bsqlite_master WHERE type = 'table'/gi, "information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' AND table_name <> 'pictaria_schema_version'")
++    .replace(/(table_type = 'BASE TABLE' AND table_name <> 'pictaria_schema_version') AND name =/gi, '$1 AND table_name =')
++    .replace(/^BEGIN (IMMEDIATE|EXCLUSIVE)$/i, 'BEGIN')
++    .replace(/\bINTEGER PRIMARY KEY AUTOINCREMENT\b/gi, 'BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY')
++    .replace(/\bWITHOUT ROWID\b/gi, '')
++    .replace(/\s+INDEXED BY \w+/gi, '')
++    .replace(/\bCAST\(([\w.]+) AS BLOB\)/gi, "convert_to($1::text, 'UTF8')")
++    .replace(/\btypeof\(([\w.]+)\)/gi, "(CASE WHEN $1 IS NULL THEN 'null' WHEN pg_typeof($1) = 'bigint'::regtype THEN 'integer' ELSE 'text' END)")
++    .replace(/\bjson_extract\(([^,]+),\s*('(\$\.(?:[\w.]+))')\)/gi, (call, source, path, key) =>
++      /(?:\.expiresAt|\.has_people|\.preparationFailures|\.formatVersion|\.contractVersion)$/.test(key)
++        && !key.includes('.properties.') ? `pictaria_json_number(${source}, ${path})` : call)
++    .replace(/\bjson_array_length\(([\w.]+)\)/gi, 'json_array_length($1::json)')
++    .replace(/\bjson_each\(([^)]+)\)/gi, 'json_array_elements_text($1::json)')
++    .replace(/\bprintf\('%020d', (\w+)\)/gi, "lpad($1::text, 20, '0')")
++    .replace(/\b([\w.]+) COLLATE NOCASE\b/gi, 'lower($1)')
++    .replace(/\bIS (NOT )?(?=[a-z_]+\.)/gi, (_, not) => not ? 'IS DISTINCT FROM ' : 'IS NOT DISTINCT FROM ')
++    .replace(/\bCASE WHEN \? THEN\b/gi, 'CASE WHEN ?::bigint <> 0 THEN')
++    .replace(/\bWHERE 0\b/gi, 'WHERE FALSE')
++    .replace(/\b(key) (NOT )?GLOB (\?|'[^']*\*')/gi, (_, key, not, pattern) =>
++      `starts_with(${key}, left(${pattern}::text, -1)) IS ${not ? 'FALSE' : 'TRUE'}`)
++    .replace(/\bSELECT rowid,/gi, 'SELECT ctid AS rowid,')
++    .replace(/(?<!AS )\browid\b/gi, 'ctid')
++    .replace(/\bCAST\(([^()]+) AS REAL\)/gi, 'CAST($1 AS DOUBLE PRECISION)')
++    .replace(/\b(INTEGER|REAL|BLOB)(?=\s*(?:,|\)|NOT NULL|DEFAULT|PRIMARY KEY|CHECK|REFERENCES))/gi, (type) =>
++      ({ INTEGER: 'BIGINT', REAL: 'DOUBLE PRECISION', BLOB: 'BYTEA' })[type.toUpperCase()]);
++  let parameter = 0;
++  return tokens(translateFunctions(sql)).map((token) => {
++    if (token === '?') return `$${++parameter}`;
++    return token;
++  }).join('');
++}
+diff --git a/src/database/postgres-worker.mjs b/src/database/postgres-worker.mjs
+new file mode 100644
+index 0000000..f5fc77a
+--- /dev/null
++++ b/src/database/postgres-worker.mjs
+@@ -0,0 +1,158 @@
++import { readFileSync } from 'node:fs';
++import { parentPort, workerData } from 'node:worker_threads';
++import pg from 'pg';
++import { postgresSql, statements } from './postgres-sql.mjs';
++
++const { port, signal, url, schema, readOnly } = workerData;
++const client = new pg.Client({
++  connectionString: url,
++  connectionTimeoutMillis: 5_000,
++  keepAlive: true,
++  keepAliveInitialDelayMillis: 5_000,
++  statement_timeout: 30_000,
++  lock_timeout: 5_000,
++  application_name: 'pictaria-server',
++});
++pg.types.setTypeParser(20, Number);
++pg.types.setTypeParser(1700, Number);
++client.on('error', () => parentPort.postMessage('disconnected'));
++
++const tableDefinitions = new Map();
++const compiledStatements = new Map();
++const IDENTITY_TABLES = new Set([
++  'processing_runs', 'manual_overrides', 'pending_sync_jobs', 'enrich_queue', 'job_runs',
++  'activity_log', 'enrich_timing_runs', 'enrich_photo_executions', 'enrich_provider_attempts', 'embedding_spaces',
++]);
++
++async function upsert(sql) {
++  const match = /^INSERT OR (IGNORE|REPLACE) INTO\s+(\w+)\s*(?:\(([^)]+)\))?/i.exec(sql);
++  if (!match) return sql;
++  const [, policy, table, explicitColumns] = match;
++  const insert = sql.replace(/^INSERT OR (?:IGNORE|REPLACE)/i, 'INSERT');
++  if (policy.toUpperCase() === 'IGNORE') return insert + ' ON CONFLICT DO NOTHING';
++
++  if (!tableDefinitions.has(table)) {
++    const { rows } = await client.query(`
++      SELECT a.attname AS name, EXISTS (
++        SELECT FROM pg_index i
++        WHERE i.indrelid = a.attrelid AND i.indisprimary AND a.attnum = ANY(i.indkey)
++      ) AS primary_key
++      FROM pg_attribute a
++      WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped
++      ORDER BY a.attnum
++    `, [table]);
++    tableDefinitions.set(table, rows);
++  }
++  const definition = tableDefinitions.get(table);
++  const keys = definition.filter((row) => row.primary_key).map((row) => row.name);
++  if (!keys.length) throw new Error(`Missing primary key for PostgreSQL upsert on ${table}.`);
++  const columns = explicitColumns ? explicitColumns.split(',').map((name) => name.trim()) : definition.map((row) => row.name);
++  const updates = columns.filter((name) => !keys.includes(name)).map((name) => `${name}=excluded.${name}`);
++  return `${insert} ON CONFLICT (${keys.join(', ')}) DO ${updates.length ? `UPDATE SET ${updates.join(', ')}` : 'NOTHING'}`;
++}
++
++let outerSavepoint;
++
++async function executeSchema(sql) {
++  // Trigger bodies contain semicolons and need a PostgreSQL trigger function.
++  // Use one converter for the small, uniform AFTER triggers in the schemas.
++  const triggers = new Map();
++  sql = sql.replace(/CREATE TRIGGER (?:IF NOT EXISTS )?(\w+)\s+AFTER (INSERT|UPDATE|DELETE) ON (\w+)(?:\s+WHEN ([\s\S]*?))?\s+BEGIN\s+([\s\S]*?)\s+END\s*;/gi,
++    (_, name, event, table, condition, body) => {
++      triggers.set(name, { event, table, condition, body });
++      return `PICTARIA_TRIGGER ${name};`;
++    });
++  for (const statement of statements(sql)) {
++    if (/^DROP TRIGGER IF EXISTS /i.test(statement)) continue;
++    if (statement.startsWith('PICTARIA_TRIGGER ')) {
++      const name = statement.slice('PICTARIA_TRIGGER '.length);
++      const { event, table, condition, body } = triggers.get(name);
++      const when = condition && condition !== '1' ? condition.replace(/\|\| '0'/g, 'FALSE') : null;
++      const commands = [];
++      for (const item of statements(body)) commands.push(postgresSql(await upsert(item)));
++      await client.query(`
++        CREATE OR REPLACE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql
++        SET search_path TO ${schema}, pg_catalog AS $trigger$
++        BEGIN
++          ${when ? `IF ${postgresSql(when)} THEN` : ''}
++          ${commands.join(';\n')};
++          ${when ? 'END IF;' : ''}
++          RETURN NULL;
++        END
++        $trigger$;
++        DROP TRIGGER IF EXISTS ${name} ON ${table};
++        CREATE TRIGGER ${name} AFTER ${event} ON ${table}
++          FOR EACH ROW EXECUTE FUNCTION ${name}();
++      `);
++    } else {
++      const savepoint = /^SAVEPOINT (\w+)$/i.exec(statement)?.[1];
++      if (savepoint && client.getTransactionStatus() === 'I') {
++        await client.query('BEGIN');
++        outerSavepoint = savepoint;
++      }
++      await client.query(postgresSql(await upsert(statement)));
++      if (outerSavepoint && statement.toLowerCase() === `release ${outerSavepoint}`.toLowerCase()) {
++        outerSavepoint = undefined;
++        await client.query('COMMIT');
++      }
++    }
++  }
++}
++
++async function request({ operation, sql, values }) {
++  if (operation === 'open') {
++    try {
++      await client.connect();
++    } catch {
++      throw new Error('Cannot connect to PostgreSQL. Check PICTARIA_DATABASE_URL and database permissions.');
++    }
++    if (!readOnly) await client.query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
++    await client.query(`SET search_path TO ${schema}, pg_catalog; SET TIME ZONE 'UTC'; SET DateStyle TO 'ISO, YMD'`);
++    if (readOnly) await client.query('SET default_transaction_read_only = on; SET default_transaction_isolation = \'repeatable read\'');
++    return;
++  }
++  if (operation === 'close') return client.end();
++  if (operation === 'functions') {
++    return client.query(readFileSync(new URL('./postgres-functions.sql', import.meta.url), 'utf8')).then(() => undefined);
++  }
++  if (operation === 'exec') return executeSchema(sql);
++  if (operation === 'native') return (await client.query(sql, values)).rows;
++  if (operation === 'declare') {
++    const [name, ...parameters] = values;
++    const query = postgresSql(statements(sql).join(';'));
++    await client.query(`DECLARE ${name} NO SCROLL CURSOR FOR ${query}`, parameters);
++    return;
++  }
++  const key = `${operation}: ${sql}`;
++  let query = compiledStatements.get(key);
++  if (!query) {
++    query = postgresSql(await upsert(statements(sql).join(';')));
++    const table = /^INSERT INTO\s+(\w+)/i.exec(query)?.[1];
++    if (operation === 'run' && IDENTITY_TABLES.has(table) && !/\bRETURNING\b/i.test(query)) {
++      query += ' RETURNING id';
++    }
++    if (compiledStatements.size >= 500) compiledStatements.clear();
++    compiledStatements.set(key, query);
++  }
++  const result = await client.query(query, values.map((value) =>
++    value instanceof Uint8Array ? Buffer.from(value) : value));
++  if (operation === 'run') return { changes: result.rowCount, lastInsertRowid: result.rows[0]?.id ?? 0 };
++  if (operation === 'get') return result.rows[0];
++  return result.rows;
++}
++
++port.on('message', async (message) => {
++  try {
++    port.postMessage({ result: await request(message) });
++  } catch (error) {
++    // Server details may include a bound value. Preserve SQLSTATE for callers.
++    const message = error.code === '23505' ? 'PostgreSQL unique constraint failed.'
++      : error.code === '23503' ? 'PostgreSQL foreign-key constraint failed.'
++      : error.code === '23514' ? 'PostgreSQL check constraint failed.'
++      : error.message;
++    port.postMessage({ error: { message, code: error.code } });
++  } finally {
++    Atomics.store(signal, 0, 1);
++    Atomics.notify(signal, 0);
++  }
++});
+diff --git a/src/database/postgres.mjs b/src/database/postgres.mjs
+new file mode 100644
+index 0000000..d226467
+--- /dev/null
++++ b/src/database/postgres.mjs
+@@ -0,0 +1,103 @@
++import { MessageChannel, receiveMessageOnPort, Worker } from 'node:worker_threads';
++
++const TIMEOUT_MS = 35_000;
++
++// The repositories use synchronous transactions. A dedicated connection in a
++// worker keeps their transaction boundaries intact while PostgreSQL network
++// I/O is serviced on the worker's event loop.
++export class PostgresDatabase {
++  constructor({ url, schema }, { readOnly = false, onDisconnect } = {}) {
++    if (!['pictaria_enrich', 'pictaria_frame', 'pictaria_insights'].includes(schema)) {
++      throw new Error('Invalid Pictaria PostgreSQL schema.');
++    }
++    this.dialect = 'postgres';
++    this.cursorId = 0;
++    this.signal = new Int32Array(new SharedArrayBuffer(4));
++    const { port1, port2 } = new MessageChannel();
++    this.port = port1;
++    this.worker = new Worker(new URL('./postgres-worker.mjs', import.meta.url), {
++      workerData: { url, schema, readOnly, signal: this.signal, port: port2 },
++      transferList: [port2],
++      execArgv: [],
++    });
++    const disconnected = () => {
++      if (this.closed) return;
++      this.dispose();
++      onDisconnect?.();
++    };
++    this.worker.on('error', disconnected);
++    this.worker.on('exit', disconnected);
++    this.worker.on('message', disconnected);
++    this.worker.unref();
++    this.port.unref();
++    try {
++      this.request('open');
++    } catch (error) {
++      this.dispose();
++      throw error;
++    }
++  }
++
++  request(operation, sql, values) {
++    if (this.closed) throw new Error('PostgreSQL connection is closed.');
++    Atomics.store(this.signal, 0, 0);
++    this.port.postMessage({ operation, sql, values });
++    if (Atomics.wait(this.signal, 0, 0, TIMEOUT_MS) === 'timed-out') {
++      this.dispose();
++      throw new Error('PostgreSQL connection did not respond before the deadline.');
++    }
++    const response = receiveMessageOnPort(this.port)?.message;
++    if (!response) {
++      this.dispose();
++      throw new Error('PostgreSQL worker returned no response.');
++    }
++    const { result, error } = response;
++    if (error) throw Object.assign(new Error(error.message), { code: error.code });
++    return result;
++  }
++
++  exec(sql) {
++    this.request('exec', sql);
++  }
++
++  prepare(sql) {
++    return {
++      all: (...values) => this.request('all', sql, values),
++      iterate: (...values) => this.iterate(sql, values),
++      get: (...values) => this.request('get', sql, values),
++      run: (...values) => this.request('run', sql, values),
++    };
++  }
++
++  *iterate(sql, values) {
++    // Both repository callers already own a transaction (startup
++    // reconciliation or a repeatable-read grouping snapshot).
++    const name = `pictaria_cursor_${++this.cursorId}`;
++    this.request('declare', sql, [name, ...values]);
++    try {
++      for (;;) {
++        const rows = this.request('native', `FETCH 128 FROM ${name}`);
++        yield* rows;
++        if (rows.length < 128) break;
++      }
++    } finally {
++      this.request('native', `CLOSE ${name}`);
++    }
++  }
++
++  close() {
++    if (this.closed) return;
++    try {
++      this.request('close');
++    } finally {
++      this.dispose();
++    }
++  }
++
++  dispose() {
++    if (this.closed) return;
++    this.closed = true;
++    this.port.close();
++    void this.worker.terminate();
++  }
++}
+diff --git a/src/embeddings/store.mjs b/src/embeddings/store.mjs
+index 28f2c6c..f4c4a31 100644
+--- a/src/embeddings/store.mjs
++++ b/src/embeddings/store.mjs
+@@ -128,7 +128,7 @@ export class EmbeddingStore {
+   // rests on the recorded checksum/thumbhash described above.
+   isCurrent(assetId, spaceId, { imageSha256 = null } = {}) {
+     return this.db.prepare(`SELECT 1 FROM asset_embeddings e JOIN assets a ON a.asset_id=e.asset_id
+-      WHERE e.asset_id=? AND e.space_id=? AND ${CURRENT} AND (? IS NULL OR e.image_sha256=?)`)
++      WHERE e.asset_id=? AND e.space_id=? AND ${CURRENT} AND (CAST(? AS TEXT) IS NULL OR e.image_sha256=?)`)
+       .get(assetId, spaceId, imageSha256, imageSha256) !== undefined;
+   }
+ 
+@@ -207,7 +207,7 @@ export class EmbeddingStore {
+     const counts = space ? this.db.prepare(`SELECT COUNT(*) AS vectors,
+         COALESCE(SUM(CASE WHEN a.asset_id IS NOT NULL AND ${CURRENT} THEN 1 ELSE 0 END), 0) AS current
+       FROM asset_embeddings e LEFT JOIN assets a ON a.asset_id=e.asset_id WHERE e.space_id=?`).get(space.id) : null;
+-    const other = this.db.prepare('SELECT COUNT(*) AS n FROM asset_embeddings WHERE space_id IS NOT ?').get(space?.id ?? null).n;
++    const other = this.db.prepare('SELECT COUNT(*) AS n FROM asset_embeddings WHERE space_id IS DISTINCT FROM ?').get(space?.id ?? null).n;
+     const value = {
+       space: space ? { dims: space.dims, createdAt: space.createdAt, verifiedAt: space.verifiedAt } : null,
+       vectors: counts?.vectors ?? 0,
+@@ -239,10 +239,10 @@ export class EmbeddingStore {
+   // photo walks again from the top (EmbeddingBackfill does).
+   missingEnriched(spaceId, { after = null, limit = 200 } = {}) {
+     const rows = after
+-      ? this.db.prepare(`SELECT a.asset_id AS assetId, ${CAPTURE_ORDER} AS capturedAt ${ENRICHED} AND NOT ${HAS_CURRENT}
++      ? this.db.prepare(`SELECT a.asset_id AS "assetId", ${CAPTURE_ORDER} AS "capturedAt" ${ENRICHED} AND NOT ${HAS_CURRENT}
+           AND (${CAPTURE_ORDER}, a.asset_id) < (?, ?) ORDER BY ${CAPTURE_ORDER} DESC, a.asset_id DESC LIMIT ?`)
+         .all(spaceId, after.capturedAt, after.assetId, limit)
+-      : this.db.prepare(`SELECT a.asset_id AS assetId, ${CAPTURE_ORDER} AS capturedAt ${ENRICHED} AND NOT ${HAS_CURRENT}
++      : this.db.prepare(`SELECT a.asset_id AS "assetId", ${CAPTURE_ORDER} AS "capturedAt" ${ENRICHED} AND NOT ${HAS_CURRENT}
+           ORDER BY ${CAPTURE_ORDER} DESC, a.asset_id DESC LIMIT ?`).all(spaceId, limit);
+     return rows.map((row) => ({ assetId: row.assetId, capturedAt: row.capturedAt }));
+   }
+@@ -259,7 +259,7 @@ export class EmbeddingStore {
+       return cached.value;
+     }
+     const inUse = this.latestSpace({ backend, model })?.id ?? null;
+-    const value = this.db.prepare(`SELECT s.id, s.model, s.dims, s.created_at AS createdAt, s.verified_at AS verifiedAt,
++    const value = this.db.prepare(`SELECT s.id, s.model, s.dims, s.created_at AS "createdAt", s.verified_at AS "verifiedAt",
+         COUNT(e.asset_id) AS vectors,
+         COALESCE(SUM(CASE WHEN a.asset_id IS NOT NULL AND ${CURRENT} THEN 1 ELSE 0 END), 0) AS current
+       FROM embedding_spaces s LEFT JOIN asset_embeddings e ON e.space_id=s.id LEFT JOIN assets a ON a.asset_id=e.asset_id
+diff --git a/src/enrich/aiTagSyncStore.mjs b/src/enrich/aiTagSyncStore.mjs
+index e06b0f2..45177cb 100644
+--- a/src/enrich/aiTagSyncStore.mjs
++++ b/src/enrich/aiTagSyncStore.mjs
+@@ -30,7 +30,7 @@ export class AiTagSyncStore {
+   }
+ 
+   next(limit = 10) {
+-    return this.db.prepare(`SELECT asset_id AS assetId,generation,attempts FROM ai_tag_sync
++    return this.db.prepare(`SELECT asset_id AS "assetId",generation,attempts FROM ai_tag_sync
+       WHERE status='pending' ORDER BY updated_at,asset_id LIMIT ?`).all(Math.max(1, Math.min(10, limit)));
+   }
+ 
+diff --git a/src/enrich/profiles.mjs b/src/enrich/profiles.mjs
+index f13418a..5085372 100644
+--- a/src/enrich/profiles.mjs
++++ b/src/enrich/profiles.mjs
+@@ -36,7 +36,9 @@ export class EnrichmentProfiles {
+       // and an existing "My profile" are left alone.
+       const starter = this.db.prepare(`SELECT p.id FROM enrich_profiles p
+         JOIN enrich_profile_revisions r ON r.id = p.current_revision_id
+-        WHERE p.rowid = (SELECT MIN(rowid) FROM enrich_profiles)
++        WHERE ${this.db.dialect === 'postgres'
++          ? 'p.id = (SELECT profile_id FROM enrich_profile_revisions ORDER BY created_at, id LIMIT 1)'
++          : 'p.rowid = (SELECT MIN(rowid) FROM enrich_profiles)'}
+           AND p.name = 'Default' AND r.name = 'Default' AND r.revision = 1
+           AND p.archived = 0
+           AND NOT EXISTS (SELECT 1 FROM enrich_profiles WHERE name = 'My profile')`).get();
+diff --git a/src/enrich/repository.mjs b/src/enrich/repository.mjs
+index 61c2e62..2662bfa 100644
+--- a/src/enrich/repository.mjs
++++ b/src/enrich/repository.mjs
+@@ -7,10 +7,9 @@ import { CurateRepository } from '../curate/repository.mjs';
+ import { copyFileSync, mkdirSync, readFileSync } from 'node:fs';
+ import { dirname, join } from 'node:path';
+ import { fileURLToPath } from 'node:url';
+-import { DatabaseSync } from 'node:sqlite';
++import { openDatabase } from '../database/open.mjs';
+ 
+ import { addColumnIfMissing, migrateDatabase, tableExists } from '../migrations.mjs';
+-import { preparePrivateDatabasePath, restrictPrivateDatabaseModes } from '../privateDatabase.mjs';
+ import { sanitizeDiagnostic } from '../diagnostics.mjs';
+ import { validateAssetBatch } from './assetBatch.mjs';
+ import { EnrichTimingStore, TIMING_SCHEMA } from './timing.mjs';
+@@ -612,21 +611,16 @@ function migrateManualOverrides(db, schemaSql) {
+ }
+ 
+ export class Repository {
+-  constructor(databasePath) {
++  constructor(databasePath, postgres) {
+     this.databasePath = String(databasePath);
+-    preparePrivateDatabasePath(this.databasePath);
+-    this.db = new DatabaseSync(this.databasePath);
++    this.postgres = postgres;
++    this.db = openDatabase(this.databasePath, postgres);
+     this.timings = new EnrichTimingStore(this.db);
+     this.aiTagSync = new AiTagSyncStore(this.db);
+     this.curate = new CurateRepository(this);
+     this.decisions = new DecisionRepository(this);
+     this.embeddings = new EmbeddingStore(this.db);
+     this.historyRetention = historyRetention();
+-    this.db.exec('PRAGMA journal_mode = WAL');
+-    // Decisions, tags, and captions are personal data: keep the DB (and its
+-    // WAL/SHM sidecars) private to the server user even under a permissive
+-    // umask. Some filesystems reject chmod — warn and continue.
+-    restrictPrivateDatabaseModes(this.databasePath);
+   }
+ 
+   close() {
+@@ -634,7 +628,12 @@ export class Repository {
+   }
+ 
+   initSchema() {
+-    const schemaSql = readFileSync(SCHEMA_PATH, 'utf8') + TIMING_SCHEMA + DISCOVERY_SCHEMA + AI_TAG_SYNC_SCHEMA + CURATE_SCHEMA + DECISION_SCHEMA + EMBEDDING_SCHEMA;
++    let baseSchema = readFileSync(SCHEMA_PATH, 'utf8');
++    if (this.postgres) {
++      baseSchema = baseSchema.replace(/CREATE VIRTUAL TABLE IF NOT EXISTS caption_index[\s\S]*?fts5vocab[^;]+;/,
++        readFileSync(new URL('../database/postgres-captions.sql', import.meta.url), 'utf8'));
++    }
++    const schemaSql = baseSchema + TIMING_SCHEMA + DISCOVERY_SCHEMA + AI_TAG_SYNC_SCHEMA + CURATE_SCHEMA + DECISION_SCHEMA + EMBEDDING_SCHEMA;
+     const result = migrateDatabase(this.db, {
+       schema: schemaSql,
+       migrations: ENRICH_MIGRATIONS,
+@@ -668,6 +667,7 @@ export class Repository {
+   }
+ 
+   backupTo(outputPath) {
++    if (this.postgres) throw new Error('Use pg_dump to back up PostgreSQL.');
+     mkdirSync(dirname(String(outputPath)), { recursive: true });
+     // Checkpoint the WAL so a plain file copy is a complete snapshot.
+     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+@@ -712,8 +712,8 @@ export class Repository {
+       return work();
+     }
+     const manualOverridePruneIdBefore = this.#nextManualOverridePruneId;
+-    this.#inTransaction = true;
+     this.db.exec('BEGIN IMMEDIATE');
++    this.#inTransaction = true;
+     try {
+       const result = work();
+       this.db.exec('COMMIT');
+@@ -1382,19 +1382,23 @@ export class Repository {
+     if (tokens.length === 0) {
+       return [];
+     }
+-    const match = tokens.map((token) => `"${token}"*`).join(' ');
++    const match = this.postgres
++      ? tokens.map((token) => `'${token}':*`).join(' & ')
++      : tokens.map((token) => `"${token}"*`).join(' ');
++    const search = this.postgres
++      ? "WHERE document @@ to_tsquery('simple', ?) ORDER BY ts_rank(document, to_tsquery('simple', ?)) DESC, asset_id"
++      : 'WHERE caption_index MATCH ? ORDER BY rank';
+     const cap = Math.max(1, Math.min(Number(limit) || 100, 1000));
+     return this.db
+       .prepare(
+         `
+         SELECT asset_id, caption, short_caption
+         FROM caption_index
+-        WHERE caption_index MATCH ?
+-        ORDER BY rank
++        ${search}
+         LIMIT ?
+         `,
+       )
+-      .all(match, cap)
++      .all(...(this.postgres ? [match, match, cap] : [match, cap]))
+       .map((row) => ({ assetId: row.asset_id, caption: row.caption, shortCaption: row.short_caption }));
+   }
+ 
+@@ -2124,9 +2128,9 @@ export class Repository {
+         SELECT f.asset_id, MIN(f.id) AS first_failure_id
+         FROM processing_runs f
+         WHERE f.status IN ('failed', 'failed_infra')
+-          AND f.provider IS ? AND f.model IS ?
+-          AND f.prompt_version IS ? AND f.taxonomy_version IS ?
+-          AND (? IS NULL OR f.configuration_id = ?)
++          AND f.provider IS NOT DISTINCT FROM ? AND f.model IS NOT DISTINCT FROM ?
++          AND f.prompt_version IS NOT DISTINCT FROM ? AND f.taxonomy_version IS NOT DISTINCT FROM ?
++          AND (CAST(? AS TEXT) IS NULL OR f.configuration_id = ?)
+           AND f.started_at >= ? AND f.started_at <= ?
+           AND NOT EXISTS (
+             SELECT 1 FROM processing_runs s
+diff --git a/src/enrich/schema.sql b/src/enrich/schema.sql
+index df0c93a..5544bf0 100644
+--- a/src/enrich/schema.sql
++++ b/src/enrich/schema.sql
+@@ -1,3 +1,23 @@
++CREATE TABLE IF NOT EXISTS enrich_profiles (
++  id TEXT PRIMARY KEY,
++  name TEXT NOT NULL,
++  current_revision_id TEXT NOT NULL,
++  archived INTEGER NOT NULL DEFAULT 0,
++  is_default INTEGER NOT NULL DEFAULT 0
++);
++CREATE UNIQUE INDEX IF NOT EXISTS idx_enrich_profile_default ON enrich_profiles(is_default) WHERE is_default = 1;
++CREATE TABLE IF NOT EXISTS enrich_profile_revisions (
++  id TEXT PRIMARY KEY,
++  profile_id TEXT NOT NULL REFERENCES enrich_profiles(id),
++  revision INTEGER NOT NULL,
++  name TEXT NOT NULL,
++  system_prompt TEXT NOT NULL,
++  user_template TEXT NOT NULL,
++  taxonomy_json TEXT NOT NULL,
++  created_at TEXT NOT NULL,
++  UNIQUE(profile_id, revision)
++);
++
+ CREATE TABLE IF NOT EXISTS assets (
+   asset_id TEXT PRIMARY KEY,
+   original_path TEXT,
+@@ -244,23 +264,3 @@ CREATE INDEX IF NOT EXISTS idx_activity_log_at ON activity_log(at DESC, id DESC)
+ CREATE INDEX IF NOT EXISTS idx_activity_log_category_at ON activity_log(category, at DESC, id DESC);
+ CREATE INDEX IF NOT EXISTS idx_activity_log_type_at ON activity_log(type, at DESC, id DESC);
+ CREATE INDEX IF NOT EXISTS idx_activity_log_provider_at ON activity_log(provider, at DESC, id DESC);
+-
+-CREATE TABLE IF NOT EXISTS enrich_profiles (
+-  id TEXT PRIMARY KEY,
+-  name TEXT NOT NULL,
+-  current_revision_id TEXT NOT NULL,
+-  archived INTEGER NOT NULL DEFAULT 0,
+-  is_default INTEGER NOT NULL DEFAULT 0
+-);
+-CREATE UNIQUE INDEX IF NOT EXISTS idx_enrich_profile_default ON enrich_profiles(is_default) WHERE is_default = 1;
+-CREATE TABLE IF NOT EXISTS enrich_profile_revisions (
+-  id TEXT PRIMARY KEY,
+-  profile_id TEXT NOT NULL REFERENCES enrich_profiles(id),
+-  revision INTEGER NOT NULL,
+-  name TEXT NOT NULL,
+-  system_prompt TEXT NOT NULL,
+-  user_template TEXT NOT NULL,
+-  taxonomy_json TEXT NOT NULL,
+-  created_at TEXT NOT NULL,
+-  UNIQUE(profile_id, revision)
+-);
+diff --git a/src/enrich/timing.mjs b/src/enrich/timing.mjs
+index 45a99cf..d44a585 100644
+--- a/src/enrich/timing.mjs
++++ b/src/enrich/timing.mjs
+@@ -130,7 +130,7 @@ export class EnrichTimingStore {
+     return this.atomic(() => {
+       this.#interruptPhotos(id);
+       this.db.prepare(`UPDATE enrich_timing_runs SET outcome = 'interrupted'
+-        WHERE outcome = 'running' AND (? IS NULL OR id = ?)`).run(id, id);
++        WHERE outcome = 'running' AND (CAST(? AS BIGINT) IS NULL OR id = ?)`).run(id, id);
+     });
+   }
+ 
+@@ -139,9 +139,9 @@ export class EnrichTimingStore {
+     // requests (including response_received) and never fabricate an end time.
+     this.db.prepare(`UPDATE enrich_provider_attempts SET outcome = 'interrupted'
+       WHERE outcome = 'running' AND photo_execution_id IN
+-      (SELECT id FROM enrich_photo_executions WHERE (? IS NULL OR timing_run_id = ?))`).run(id, id);
++      (SELECT id FROM enrich_photo_executions WHERE (CAST(? AS BIGINT) IS NULL OR timing_run_id = ?))`).run(id, id);
+     this.db.prepare(`UPDATE enrich_photo_executions SET outcome = 'interrupted'
+-      WHERE outcome = 'running' AND (? IS NULL OR timing_run_id = ?)`).run(id, id);
++      WHERE outcome = 'running' AND (CAST(? AS BIGINT) IS NULL OR timing_run_id = ?)`).run(id, id);
+   }
+ 
+   skip(runId, reason) {
+diff --git a/src/frame/ledger.mjs b/src/frame/ledger.mjs
+index f649ce4..8f046c8 100644
+--- a/src/frame/ledger.mjs
++++ b/src/frame/ledger.mjs
+@@ -1,6 +1,4 @@
+-import { DatabaseSync } from 'node:sqlite';
+-
+-import { preparePrivateDatabasePath, restrictPrivateDatabaseModes } from '../privateDatabase.mjs';
++import { openDatabase } from '../database/open.mjs';
+ 
+ const DEFAULT_FRAME_DB_PATH = './data/frame.db';
+ const DISPLAY_STATS_CHUNK_SIZE = 500;
+@@ -31,6 +29,7 @@ export const DEFAULT_FRAME_DEVICE_ID = 'frame';
+ export function createFrameLedger({
+   dbPath = process.env.FRAME_DB_PATH || DEFAULT_FRAME_DB_PATH,
+   logger = console,
++  postgres,
+   retention = {},
+   now = () => new Date(),
+ } = {}) {
+@@ -38,10 +37,7 @@ export function createFrameLedger({
+   const limits = normalizeRetention(retention);
+ 
+   try {
+-    preparePrivateDatabasePath(dbPath, logger);
+-    db = new DatabaseSync(dbPath);
+-    db.exec('PRAGMA journal_mode = WAL');
+-    restrictPrivateDatabaseModes(dbPath, logger);
++    db = openDatabase(dbPath, postgres, { logger });
+     db.exec(`
+       CREATE TABLE IF NOT EXISTS asset_displays (
+         asset_id       TEXT NOT NULL,
+@@ -100,6 +96,7 @@ export function createFrameLedger({
+     } catch {
+       // already closed or never opened
+     }
++    if (postgres) throw error;
+     return createNoopFrameLedger(limits);
+   }
+ 
+diff --git a/src/insights/repository.mjs b/src/insights/repository.mjs
+index 068a091..a77fd1c 100644
+--- a/src/insights/repository.mjs
++++ b/src/insights/repository.mjs
+@@ -1,7 +1,6 @@
+-import { DatabaseSync } from 'node:sqlite';
++import { openDatabase } from '../database/open.mjs';
+ 
+ import { addColumnIfMissing, migrateDatabase } from '../migrations.mjs';
+-import { preparePrivateDatabasePath, restrictPrivateDatabaseModes } from '../privateDatabase.mjs';
+ import { isValidCalendarDay } from './dates.mjs';
+ 
+ export const MAX_INSIGHTS_TAG_ID_LENGTH = 128;
+@@ -82,16 +81,9 @@ const INSIGHTS_MIGRATIONS = [
+ ];
+ 
+ export class InsightsRepository {
+-  constructor(dbPath) {
++  constructor(dbPath, postgres) {
+     this.dbPath = String(dbPath);
+-    preparePrivateDatabasePath(this.dbPath);
+-    this.db = new DatabaseSync(this.dbPath);
+-    // The sweep cache mirrors private library metadata (people, places,
+-    // dates) — keep it readable by the server user only, even on a bind
+-    // mount with a permissive umask. Tolerate failure (exotic filesystems);
+-    // the warning is enough.
+-    this.db.exec('PRAGMA journal_mode = WAL');
+-    restrictPrivateDatabaseModes(this.dbPath);
++    this.db = openDatabase(this.dbPath, postgres);
+     migrateDatabase(this.db, { schema: SCHEMA, migrations: INSIGHTS_MIGRATIONS });
+     this.locationGroups = [];
+     this.groupsByName = new Map();
+@@ -141,7 +133,9 @@ export class InsightsRepository {
+     this.db.exec(`
+       DROP TABLE IF EXISTS swept_assets_staging;
+       DROP TABLE IF EXISTS asset_people_staging;
+-      CREATE TABLE swept_assets_staging AS SELECT * FROM swept_assets WHERE 0;
++      ${this.db.dialect === 'postgres'
++        ? 'CREATE TABLE swept_assets_staging (LIKE swept_assets INCLUDING ALL)'
++        : 'CREATE TABLE swept_assets_staging AS SELECT * FROM swept_assets WHERE 0'};
+       CREATE TABLE asset_people_staging AS SELECT * FROM asset_people WHERE 0;
+     `);
+   }
+@@ -150,9 +144,10 @@ export class InsightsRepository {
+     this.transaction(() => {
+       this.db.exec('DELETE FROM swept_assets');
+       this.db.exec('DELETE FROM asset_people');
+-      // OR REPLACE / OR IGNORE: the staging tables carry no constraints, so
+-      // an asset repeated across sweep pages collapses here.
+-      this.db.exec('INSERT OR REPLACE INTO swept_assets SELECT * FROM swept_assets_staging');
++      // SQLite staging has no constraints and deduplicates here. PostgreSQL
++      // staging upserts on the asset primary key as pages arrive.
++      const insert = this.db.dialect === 'postgres' ? 'INSERT' : 'INSERT OR REPLACE';
++      this.db.exec(`${insert} INTO swept_assets SELECT * FROM swept_assets_staging`);
+       this.db.exec('INSERT OR IGNORE INTO asset_people SELECT * FROM asset_people_staging');
+     });
+     this.abortSweepStaging();
+@@ -413,7 +408,7 @@ export class InsightsRepository {
+   topCameras(limit = 10) {
+     return this.db
+       .prepare(`
+-        SELECT make, model, TRIM(COALESCE(make, '') || ' ' || COALESCE(model, '')) AS name, COUNT(*) AS count
++        SELECT MIN(make) AS make, MIN(model) AS model, TRIM(COALESCE(make, '') || ' ' || COALESCE(model, '')) AS name, COUNT(*) AS count
+         FROM swept_assets
+         WHERE COALESCE(model, '') != ''
+         GROUP BY name ORDER BY count DESC LIMIT ?
+@@ -499,7 +494,7 @@ export class InsightsRepository {
+         JOIN asset_people b ON b.asset_id = a.asset_id AND b.person_id > a.person_id
+         JOIN people_stats pa ON pa.id = a.person_id
+         JOIN people_stats pb ON pb.id = b.person_id
+-        GROUP BY a.person_id, b.person_id
++        GROUP BY a.person_id, b.person_id, pa.name, pb.name
+         ORDER BY count DESC
+         LIMIT ?
+       `)
+@@ -617,7 +612,7 @@ export class InsightsRepository {
+         JOIN asset_people b ON b.asset_id = a.asset_id AND b.person_id != a.person_id
+         JOIN people_stats ps ON ps.id = b.person_id
+         WHERE a.person_id = ?
+-        GROUP BY b.person_id ORDER BY count DESC, ps.name LIMIT ?
++        GROUP BY b.person_id, ps.name ORDER BY count DESC, ps.name LIMIT ?
+       `)
+       .all(personId, connectionLimit)
+       .map((row) => ({ id: row.id, name: row.name, count: Number(row.count) }));
+@@ -730,7 +725,7 @@ export class InsightsRepository {
+     const cells = this.db
+       .prepare(`
+         SELECT day, alat, alon FROM (
+-          SELECT day, ROUND(lat, 1) AS rlat, ROUND(lon, 1) AS rlon,
++          SELECT day, ROUND(CAST(lat AS NUMERIC), 1) AS rlat, ROUND(CAST(lon AS NUMERIC), 1) AS rlon,
+                  AVG(lat) AS alat, AVG(lon) AS alon,
+                  ROW_NUMBER() OVER (PARTITION BY day ORDER BY COUNT(*) DESC) AS rn
+           FROM swept_assets
+diff --git a/src/migrations.mjs b/src/migrations.mjs
+index 7032dac..6069c32 100644
+--- a/src/migrations.mjs
++++ b/src/migrations.mjs
+@@ -36,6 +36,10 @@ export function migrateDatabase(db, { schema, migrations = [], prepare = () => (
+     previous = migration.version;
+   }
+ 
++  if (db.dialect === 'postgres') {
++    db.request('functions');
++    db.exec('CREATE TABLE IF NOT EXISTS pictaria_schema_version (id BIGINT PRIMARY KEY CHECK (id = 1), version BIGINT NOT NULL)');
++  }
+   const fresh = db
+     .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table'")
+     .get().n === 0;
+@@ -43,9 +47,14 @@ export function migrateDatabase(db, { schema, migrations = [], prepare = () => (
+   const from = getUserVersion(db);
+ 
+   if (fresh) {
+-    db.exec(schema);
+-    if (latest > 0) {
+-      setUserVersion(db, latest);
++    if (db.dialect === 'postgres') db.exec('BEGIN');
++    try {
++      db.exec(schema);
++      if (latest > 0) setUserVersion(db, latest);
++      if (db.dialect === 'postgres') db.exec('COMMIT');
++    } catch (error) {
++      if (db.dialect === 'postgres') db.exec('ROLLBACK');
++      throw error;
+     }
+     return { fresh: true, from, applied: [] };
+   }
+@@ -72,10 +81,15 @@ export function migrateDatabase(db, { schema, migrations = [], prepare = () => (
+ }
+ 
+ export function getUserVersion(db) {
++  if (db.dialect === 'postgres') return db.prepare('SELECT version FROM pictaria_schema_version WHERE id = 1').get()?.version ?? 0;
+   return Number(db.prepare('PRAGMA user_version').get().user_version);
+ }
+ 
+ function setUserVersion(db, version) {
++  if (db.dialect === 'postgres') {
++    db.prepare('INSERT INTO pictaria_schema_version VALUES (1, ?) ON CONFLICT (id) DO UPDATE SET version = excluded.version').run(version);
++    return;
++  }
+   db.exec(`PRAGMA user_version = ${Number(version)}`);
+ }
+ 
+diff --git a/src/persistentState.mjs b/src/persistentState.mjs
+index b13c3fc..2d72650 100644
+--- a/src/persistentState.mjs
++++ b/src/persistentState.mjs
+@@ -254,6 +254,7 @@ export class PersistentStateGuard {
+ }
+ 
+ export function inspectPersistentTarget(target) {
++  if (target.inspect) return target.inspect();
+   if (!pathEntryExists(target.path)) {
+     return { valid: false, reason: TARGET_MISSING_REASON };
+   }
+diff --git a/src/routes/backup.mjs b/src/routes/backup.mjs
+index 3885c55..cc47280 100644
+--- a/src/routes/backup.mjs
++++ b/src/routes/backup.mjs
+@@ -18,6 +18,7 @@ export function createBackupRoutes({ config, backupState }) {
+       sendJson(response, 200, {
+         dir: config.backup.dir,
+         enabled: config.backup.enabled,
++        postgresBackupRequired: Boolean(config.postgresUrl),
+         intervalHours: config.backup.intervalHours,
+         keep: config.backup.keep,
+         running: backupState.running,
+@@ -43,7 +44,7 @@ export function createBackupRoutes({ config, backupState }) {
+         const result = await runBackup(config);
+         backupState.lastResult = result;
+         backupState.lastError = null;
+-        sendJson(response, 200, result);
++        sendJson(response, 200, { ...result, postgresBackupRequired: Boolean(config.postgresUrl) });
+       } catch (error) {
+         backupState.lastError = error instanceof Error ? error.message : String(error);
+         const coordinated = error?.code === 'backup_running';
+diff --git a/src/server.mjs b/src/server.mjs
+index db31350..ff3c011 100644
+--- a/src/server.mjs
++++ b/src/server.mjs
+@@ -67,13 +67,18 @@ import { createClientAddressResolver } from './trustedProxy.mjs';
+ import { createActivityLog } from './activity/log.mjs';
+ import { createActivityHistory } from './activity/history.mjs';
+ import { createActivityRoutes } from './routes/activity.mjs';
++import { PostgresDatabase } from './database/postgres.mjs';
++import { POSTGRES_OWNER_LOCK, postgresOptions, postgresPersistentTargets } from './database/postgres-layout.mjs';
+ import { createBrowserAuthorityPolicy } from './browserAuthority.mjs';
+ import { UpstreamPaginationError } from './pagination.mjs';
+ 
+ // Captured once, before startup checks and migrations, so health reports the
+ // age of this server process rather than the age of an individual request.
+ const serverStartedAt = Date.now();
+-const config = loadConfig();
++let config;
++function postgres(schema) {
++  return postgresOptions(config, schema);
++}
+ let resolveClientAddress;
+ let browserAuthority;
+ let persistentStateGuard;
+@@ -83,17 +88,33 @@ let serverOwner;
+ // request while a bounded drain still has an abandoned writer in this process.
+ process.once('exit', () => serverOwner?.close());
+ try {
++  config = loadConfig();
+   validateServerAuthConfig(config);
+   browserAuthority = createBrowserAuthorityPolicy(config.browserAllowedHosts);
+   serverVersion = readServerVersion(config.rootDir);
+   resolveClientAddress = createClientAddressResolver(config.trustedProxyIps);
++  if (config.postgresUrl) {
++    serverOwner = new PostgresDatabase(postgres('enrich'), {
++      onDisconnect() {
++        console.error('[Pictaria] Lost the PostgreSQL ownership connection. Exiting for supervisor restart.');
++        process.exit(1);
++      },
++    });
++    const [{ acquired }] = serverOwner.request('native',
++      'SELECT pg_try_advisory_lock($1::bigint) AS acquired', [POSTGRES_OWNER_LOCK]);
++    if (!acquired) throw new Error('Another Pictaria server already owns this PostgreSQL database.');
++    console.log('[Pictaria] PostgreSQL selected. Back up the database separately from the local data directory.');
++  } else {
++    serverOwner = acquireServerOwner(config.databasePath);
++  }
++  const targets = backupTargets(config);
++  if (config.postgresUrl) targets.push(...postgresPersistentTargets(serverOwner));
+   persistentStateGuard = new PersistentStateGuard({
+     inventoryPath: config.persistentState.inventoryPath,
+     markerPath: config.persistentState.markerPath,
+     legacySettingsMarkerPath: config.persistentState.legacySettingsMarkerPath,
+-    targets: backupTargets(config),
++    targets,
+   });
+-  serverOwner = acquireServerOwner(config.databasePath);
+   persistentStateGuard.preflight();
+   const upgrade = await preparePersistentStateUpgrade({
+     guard: persistentStateGuard,
+@@ -187,7 +208,7 @@ settingsStore.onApplied = () => {
+ };
+ const publicDir = join(config.rootDir, 'public');
+ const taxonomy = loadActiveTaxonomy(config);
+-const repo = new Repository(config.databasePath);
++const repo = new Repository(config.databasePath, postgres('enrich'));
+ repo.initSchema();
+ // Reconcile only at process startup, never when another reader opens the DB.
+ repo.timings.interrupt();
+@@ -229,11 +250,11 @@ const referee = new RefereeService({ repo, immich, review, enrichRunner, config,
+ const albumStore = new SmartAlbumStore(config.albums.dataFile, { installationSecret });
+ const albumScheduler = new SmartAlbumScheduler({ immich, store: albumStore, config: config.albums, enrichRepo: repo });
+ const frameHub = createFrameHub();
+-const frameLedger = createFrameLedger({ dbPath: config.frame.dbPath });
+-const voiceMetrics = createVoiceMetrics({ dbPath: config.frame.dbPath });
++const frameLedger = createFrameLedger({ dbPath: config.frame.dbPath, postgres: postgres('frame') });
++const voiceMetrics = createVoiceMetrics({ dbPath: config.frame.dbPath, postgres: postgres('frame') });
+ const wakeWordModels = new WakeWordModelStore(config.wakeWordModelsDir);
+ await wakeWordModels.load();
+-const insightsRepo = new InsightsRepository(config.insights.dbPath);
++const insightsRepo = new InsightsRepository(config.insights.dbPath, postgres('insights'));
+ // Settings are already loaded; mirror the user's location groups into the
+ // insights DB so city aggregates relabel them from the first query.
+ insightsRepo.setLocationGroups(config.insights.locationGroups);
+diff --git a/src/voice/metrics.mjs b/src/voice/metrics.mjs
+index 496662f..f7d33d3 100644
+--- a/src/voice/metrics.mjs
++++ b/src/voice/metrics.mjs
+@@ -1,6 +1,4 @@
+-import { DatabaseSync } from 'node:sqlite';
+-
+-import { preparePrivateDatabasePath, restrictPrivateDatabaseModes } from '../privateDatabase.mjs';
++import { openDatabase } from '../database/open.mjs';
+ 
+ const DEFAULT_FRAME_DB_PATH = './data/frame.db';
+ 
+@@ -14,15 +12,13 @@ const DEFAULT_FRAME_DB_PATH = './data/frame.db';
+ export function createVoiceMetrics({
+   dbPath = process.env.FRAME_DB_PATH || DEFAULT_FRAME_DB_PATH,
+   logger = console,
++  postgres,
+ } = {}) {
+   let db;
+ 
+   try {
+-    preparePrivateDatabasePath(dbPath, logger);
+-    db = new DatabaseSync(dbPath);
+-    db.exec('PRAGMA journal_mode = WAL');
+-    restrictPrivateDatabaseModes(dbPath, logger);
+-    migrateLegacyTable(db);
++    db = openDatabase(dbPath, postgres, { logger });
++    if (!postgres) migrateLegacyTable(db);
+     db.exec(`
+       CREATE TABLE IF NOT EXISTS voice_command_stats (
+         device_id    TEXT NOT NULL DEFAULT '',
+@@ -47,6 +43,7 @@ export function createVoiceMetrics({
+     } catch {
+       // already closed or never opened
+     }
++    if (postgres) throw error;
+     return createNoopVoiceMetrics();
+   }
+ 
+@@ -54,7 +51,7 @@ export function createVoiceMetrics({
+     INSERT INTO voice_command_stats (device_id, label, uses, last_used_at)
+     VALUES (?, ?, 1, ?)
+     ON CONFLICT(device_id, label) DO UPDATE SET
+-      uses = uses + 1,
++      uses = voice_command_stats.uses + 1,
+       last_used_at = excluded.last_used_at
+   `);
+ 
+diff --git a/test/postgres.test.mjs b/test/postgres.test.mjs
+new file mode 100644
+index 0000000..f19992e
+--- /dev/null
++++ b/test/postgres.test.mjs
+@@ -0,0 +1,136 @@
++import assert from 'node:assert/strict';
++import { spawnSync } from 'node:child_process';
++import { randomBytes } from 'node:crypto';
++import { mkdtempSync, rmSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import test from 'node:test';
++
++import { loadConfig } from '../src/config.mjs';
++import { PostgresDatabase } from '../src/database/postgres.mjs';
++import { Repository } from '../src/enrich/repository.mjs';
++import { createFrameLedger } from '../src/frame/ledger.mjs';
++import { InsightsRepository } from '../src/insights/repository.mjs';
++import { createVoiceMetrics } from '../src/voice/metrics.mjs';
++
++test('selects SQLite by default and accepts a PostgreSQL URL without exposing invalid input', () => {
++  assert.equal(loadConfig({}).postgresUrl, null);
++  assert.equal(loadConfig({ PICTARIA_DATABASE_URL: 'postgresql://db/pictaria' }).postgresUrl,
++    'postgresql://db/pictaria');
++  assert.throws(() => loadConfig({ PICTARIA_DATABASE_URL: 'bad-secret' }), {
++    message: 'PICTARIA_DATABASE_URL must be a PostgreSQL URL with a host and database name.',
++  });
++});
++
++const testUrl = process.env.PICTARIA_TEST_POSTGRES_URL;
++async function isolatedPostgres(t) {
++  const { Client } = (await import('pg')).default;
++  const admin = new Client({ connectionString: testUrl });
++  await admin.connect();
++  const name = `pictaria_test_${randomBytes(8).toString('hex')}`;
++  const handles = [];
++  t.after(async () => {
++    try {
++      for (const handle of handles.reverse()) handle.close();
++      await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
++    } finally {
++      await admin.end();
++    }
++  });
++  await admin.query(`CREATE DATABASE ${name}`);
++  const url = new URL(testUrl);
++  url.pathname = `/${name}`;
++  const store = (name) => ({ url: url.href, schema: `pictaria_${name}` });
++  const own = (handle) => { handles.push(handle); return handle; };
++  return { url: url.href, store, own };
++}
++
++test('PostgreSQL persists Enrich, Curate, Insights, Frame and voice state', { skip: !testUrl }, async (t) => {
++  const { store, own } = await isolatedPostgres(t);
++  const repo = own(new Repository(null, store('enrich')));
++  repo.initSchema();
++  repo.upsertAsset({ id: 'asset' });
++  repo.recordProcessingRun({
++    assetId: 'asset', provider: 'synthetic', model: 'synthetic',
++    promptVersion: 'v2', taxonomyVersion: 'v1', status: 'succeeded',
++    normalizedOutput: { caption: 'Alpine lake at dusk', short_caption: 'Alpine lake' },
++  });
++  assert.equal(repo.searchCaptions('alp lake')[0].assetId, 'asset');
++  assert.ok(repo.captionTerms().some((term) => term.term === 'alpine'));
++  assert.throws(() => repo.transaction(() => {
++    repo.upsertAsset({ id: 'rollback' });
++    throw new Error('abort test transaction');
++  }), /abort test transaction/);
++  assert.equal(repo.db.prepare("SELECT asset_id FROM assets WHERE asset_id='rollback'").get(), undefined);
++  repo.db.prepare("INSERT INTO review_list VALUES ('asset','test','2026-01-01')").run();
++  const reader = own(new PostgresDatabase(store('enrich'), { readOnly: true }));
++  assert.equal(reader.prepare('SELECT asset_id FROM curate_dirty').get().asset_id, 'asset');
++  assert.throws(() => reader.prepare('DELETE FROM assets').run(), { code: '25006' });
++  reader.exec('BEGIN');
++  assert.equal([...reader.prepare('SELECT asset_id FROM assets WHERE asset_id = ?').iterate('asset')][0].asset_id, 'asset');
++  reader.exec('COMMIT');
++
++  const insights = own(new InsightsRepository(null, store('insights')));
++  insights.beginSweepStaging();
++  const asset = { id: 'asset', type: 'IMAGE', day: '2026-01-02', lat: 40, lon: -105 };
++  insights.insertAssets([asset, { ...asset, city: 'Boulder' }], { staging: true });
++  insights.commitSweepStaging();
++  assert.deepEqual(insights.timelinePlaces('2026-01-01', '2026-01-31'), [
++    { day: '2026-01-02', label: 'Boulder', isCity: true, count: 1 },
++  ]);
++
++  const now = () => new Date('2026-01-03T00:00:00Z');
++  const ledger = own(createFrameLedger({ postgres: store('frame'), now, retention: { maxDisplayRows: 1 } }));
++  const voice = own(createVoiceMetrics({ postgres: store('frame') }));
++  assert.equal(ledger.recordDisplays(['first'], 'frame', now(), 'report-1').recorded, 1);
++  assert.equal(ledger.recordDisplays(['first'], 'frame', now(), 'report-1').duplicate, true);
++  assert.equal(ledger.recordDisplays(['second'], 'frame', now(), 'report-2').recorded, 1);
++  assert.deepEqual(Object.keys(ledger.getDisplayStats(['first', 'second'])), ['second']);
++  voice.record('next', { deviceId: 'frame', usedAt: now() });
++  voice.record('next', { deviceId: 'frame', usedAt: now() });
++
++  const reopened = own(new Repository(null, store('enrich')));
++  reopened.initSchema();
++  assert.equal(reopened.latestEnrichment('asset').caption, 'Alpine lake at dusk');
++  assert.equal(voice.summary('frame').commands[0].uses, 2);
++});
++
++test('SQLite import preserves rows and generated IDs and rejects a second import', { skip: !testUrl }, async (t) => {
++  const { url, store, own } = await isolatedPostgres(t);
++  const dir = mkdtempSync(join(tmpdir(), 'pictaria-sqlite-import-'));
++  t.after(() => rmSync(dir, { recursive: true, force: true }));
++  const env = {
++    ...process.env,
++    PICTARIA_DATABASE_URL: url,
++    DATABASE_PATH: join(dir, 'enrichment.sqlite'),
++    FRAME_DB_PATH: join(dir, 'frame.db'),
++    INSIGHTS_DB_PATH: join(dir, 'insights.sqlite'),
++  };
++  const sqlite = new Repository(env.DATABASE_PATH);
++  try {
++    sqlite.initSchema();
++    sqlite.upsertAsset({ id: 'asset' });
++    sqlite.db.exec("INSERT INTO manual_overrides (id, asset_id, tag, action, created_at) VALUES (42, 'asset', 'frame/favorite', 'approve', '2026-01-01')");
++    sqlite.db.exec("INSERT INTO manual_overrides SELECT 51, asset_id, tag, action, reason, created_at FROM manual_overrides WHERE id=42");
++    sqlite.db.exec('DELETE FROM manual_overrides WHERE id=51');
++  } finally {
++    sqlite.close();
++  }
++  createFrameLedger({ dbPath: env.FRAME_DB_PATH }).close();
++  createVoiceMetrics({ dbPath: env.FRAME_DB_PATH }).close();
++  new InsightsRepository(env.INSIGHTS_DB_PATH).close();
++
++  const runImport = () => spawnSync(process.execPath, [new URL('../bin/import-sqlite.mjs', import.meta.url).pathname], {
++    encoding: 'utf8', env, timeout: 20_000,
++  });
++  const result = runImport();
++  assert.equal(result.status, 0, result.stderr);
++  const postgres = own(new Repository(null, store('enrich')));
++  postgres.initSchema();
++  assert.equal(postgres.db.prepare('SELECT id FROM manual_overrides').get().id, 42);
++  const next = postgres.db.prepare('INSERT INTO manual_overrides (asset_id, tag, action, created_at) SELECT asset_id, tag, action, created_at FROM manual_overrides').run();
++  assert.equal(next.lastInsertRowid, 52);
++  const repeat = runImport();
++  assert.equal(repeat.status, 1);
++  assert.match(repeat.stderr, /already has Pictaria schemas/);
++});
+-- 
+2.52.0
+

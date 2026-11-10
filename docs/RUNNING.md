@@ -14,6 +14,59 @@ you switch to the intended release and restart, the supervisor relaunches it.
 A run that's in flight when the process stops is recorded as *interrupted* in
 the run history; its queue item stays queued and resumes on the next run.
 
+## Running with PostgreSQL
+
+SQLite is the default. To select PostgreSQL, provision a dedicated PostgreSQL
+16 or newer database and give Pictaria a login that owns that database or has
+permission to create and own schemas in it. Run one Pictaria Server per database.
+Use a PostgreSQL instance on a low-latency connection because repository
+operations still use synchronous transaction boundaries.
+
+Set this in `.env` for a native or Compose installation:
+
+```dotenv
+PICTARIA_DATABASE_URL=postgresql://pictaria:password@db.example:5432/pictaria
+```
+
+URL-encode special characters in the user or password. Protect the file as
+you would other service credentials. For a native checkout, install the driver
+with `npm ci --omit=dev` before starting. If running this checkout with Compose,
+build the image with `docker compose build pictaria`. The database host must be
+reachable from the server or container. Pictaria creates the `pictaria_enrich`,
+`pictaria_frame`, and `pictaria_insights` schemas. Settings, Smart Albums, wake
+word models, and session state still use the local data directory.
+
+### Move an existing SQLite installation
+
+1. Back up the SQLite installation, then stop Pictaria. Use a fresh dedicated
+   PostgreSQL database. The import expects SQLite files initialized by this
+   version of Pictaria, so start this version once in SQLite mode first if
+   upgrading from an older release.
+2. Set `PICTARIA_DATABASE_URL` and keep the original data directory and SQLite
+   paths configured. Run the import once, with the server stopped.
+
+   Native:
+
+   ```sh
+   node --env-file-if-exists=.env bin/import-sqlite.mjs
+   ```
+
+   Docker Compose:
+
+   ```sh
+   docker compose build pictaria
+   docker compose run --rm --no-deps pictaria node bin/import-sqlite.mjs
+   ```
+
+3. Start Pictaria with the same URL and data directory. The import preserves
+   the SQLite databases and refuses a destination that already has Pictaria
+   schemas. Removing the URL and restarting returns to the retained SQLite
+   databases. Any writes made after the switch stay in PostgreSQL.
+
+In PostgreSQL mode, Pictaria's built-in snapshots cover the local files.
+Schedule a PostgreSQL backup separately and restore it together with the local
+files. See [PostgreSQL backups](BACKUP.md#postgresql-backups).
+
 ## Docker with a VPN-owned host address
 
 The stock compose file publishes `4080:4080` on the host without depending on
